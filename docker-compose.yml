@@ -1,0 +1,15 @@
+services:
+  rlbot:
+    build: .
+    container_name: rlbot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+      - ./wake_key:/wake_key:ro
+      - ./stop_key:/stop_key:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

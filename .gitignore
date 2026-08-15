@@ -1,0 +1,8 @@
+.env
+wake_key
+wake_key.pub
+stop_key
+stop_key.pub
+data/
+*.bak
+__pycache__/
