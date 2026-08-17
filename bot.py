@@ -85,11 +85,24 @@ TRN_API_KEY = os.getenv("TRN_API_KEY", "046ef1ba-317b-4f63-9642-e58570b9a7d0")
 
 TRN_BASE = "https://public-api.tracker.gg/v2/rocket-league/standard/profile"
 
+# This Paper build's threaded region scheduler ("Moonrise") intermittently
+# dispatches RCON commands onto a worker thread instead of the primary one;
+# its own AsyncCatcher then rejects them. Race, not a config/plugin issue —
+# a fresh connection's next attempt is usually fine, so retry past it.
+_ASYNC_CATCHER_MARKER = "Cannot perform command async"
+_RCON_RETRIES = 3
+
+
 async def rcon(cmd: str) -> str:
     try:
-        async with Client(MC_HOST, MC_RCON_PORT, MC_RCON_PASSWORD) as c:
-            resp, _ = await asyncio.wait_for(c.send_cmd(cmd), timeout=5)
-            return resp or "(no output)"
+        for attempt in range(_RCON_RETRIES):
+            async with Client(MC_HOST, MC_RCON_PORT, MC_RCON_PASSWORD) as c:
+                resp, _ = await asyncio.wait_for(c.send_cmd(cmd), timeout=5)
+            if _ASYNC_CATCHER_MARKER not in (resp or ""):
+                return resp or "(no output)"
+            if attempt < _RCON_RETRIES - 1:
+                await asyncio.sleep(0.3)
+        return resp or "(no output)"
     except asyncio.TimeoutError:
         return "RCON timed out — server may be starting or unresponsive."
     except IncorrectPasswordError:
@@ -203,6 +216,12 @@ async def mc_chat_bridge():
                 username=MC_SSH_USER,
                 client_keys=[MC_BRIDGE_SSH_KEY],
                 known_hosts=None,
+                # Without keepalives a dropped connection (NAT/conntrack
+                # timeout, network blip) leaves proc.stdout awaiting data
+                # that will never arrive — no exception, task hangs forever.
+                # These make asyncssh notice and raise so we reconnect.
+                keepalive_interval=30,
+                keepalive_count_max=3,
             ) as conn:
                 async with conn.create_process(f"tail -F -n0 {MC_CHAT_LOG_PATH}") as proc:
                     async for line in proc.stdout:
@@ -388,9 +407,14 @@ async def _mc_status():
     25565 here — lazymc answers pings itself even while the container is
     stopped, so a ping always looks "up"."""
     try:
-        async with Client(MC_HOST, MC_RCON_PORT, MC_RCON_PASSWORD) as c:
-            resp, _ = await asyncio.wait_for(c.send_cmd("list"), timeout=5)
-            return resp
+        for attempt in range(_RCON_RETRIES):
+            async with Client(MC_HOST, MC_RCON_PORT, MC_RCON_PASSWORD) as c:
+                resp, _ = await asyncio.wait_for(c.send_cmd("list"), timeout=5)
+            if _ASYNC_CATCHER_MARKER not in (resp or ""):
+                return resp
+            if attempt < _RCON_RETRIES - 1:
+                await asyncio.sleep(0.3)
+        return resp
     except (RCONConnectionError, asyncio.TimeoutError, IncorrectPasswordError):
         return None
 
