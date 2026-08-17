@@ -404,6 +404,29 @@ async def tps_cmd(interaction: discord.Interaction):
     resp = await rcon("mspt")
     await interaction.followup.send(f"```{resp}```")
 
+@client.tree.command(name="clear", description="Delete this bot's recent messages in this channel")
+@app_commands.describe(amount="How many recent messages to scan for bot messages to delete (default 20, max 100)")
+@app_commands.default_permissions(manage_messages=True)
+async def clear_cmd(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100] = 20):
+    await interaction.response.defer(ephemeral=True)
+
+    def is_bot_msg(m: discord.Message) -> bool:
+        return m.author.id == client.user.id
+
+    try:
+        deleted = await interaction.channel.purge(limit=amount, check=is_bot_msg)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "Missing Manage Messages permission in this channel.", ephemeral=True
+        )
+        return
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"Couldn't delete messages: {e}", ephemeral=True)
+        return
+
+    await interaction.followup.send(f"Deleted {len(deleted)} message(s).", ephemeral=True)
+
+
 @client.tree.command(name="ping", description="Check the bot is alive")
 async def ping(interaction: discord.Interaction):
     latency = round(client.latency * 1000)
@@ -531,6 +554,48 @@ class _StartButton(discord.ui.Button):
         await interaction.followup.send(msg)
 
 
+class _StartView(discord.ui.View):
+    """Only one of these should ever be live at a time — see
+    _last_start_view below. Disables its own button once idle for 5
+    minutes so a dead button doesn't sit in the channel forever."""
+
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.message: discord.Message | None = None
+        self.add_item(_StartButton())
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+# Most recent live "Start server" button, if any. Cleared (button disabled)
+# as soon as a newer /mcstatus asleep-response replaces it, so only ever one
+# start button is live in the channel at a time instead of piling up.
+_last_start_view: _StartView | None = None
+
+
+async def _retire_last_start_view() -> None:
+    global _last_start_view
+    view = _last_start_view
+    _last_start_view = None
+    if view is None:
+        return
+    view.stop()
+    for item in view.children:
+        item.disabled = True
+    if view.message is not None:
+        try:
+            await view.message.edit(view=view)
+        except discord.HTTPException:
+            pass
+
+
 # --- /mcstatus command -------------------------------------------------
 @client.tree.command(name="mcstatus", description="Minecraft server status")
 async def mcstatus_cmd(interaction: discord.Interaction):
@@ -538,13 +603,17 @@ async def mcstatus_cmd(interaction: discord.Interaction):
 
     resp = await _mc_status()
     if resp is None:
-        view = discord.ui.View(timeout=180)
-        view.add_item(_StartButton())
-        await interaction.followup.send(
+        global _last_start_view
+        await _retire_last_start_view()
+
+        view = _StartView()
+        msg = await interaction.followup.send(
             "Server is asleep — nobody's connected. lazymc will spin it up "
             "when someone joins, or use the button below.",
             view=view,
         )
+        view.message = msg
+        _last_start_view = view
         return
 
     online, names = _parse_list(resp)
