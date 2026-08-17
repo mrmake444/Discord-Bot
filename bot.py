@@ -92,6 +92,16 @@ TRN_BASE = "https://public-api.tracker.gg/v2/rocket-league/standard/profile"
 _ASYNC_CATCHER_MARKER = "Cannot perform command async"
 _RCON_RETRIES = 3
 
+# rcon() signals failure by returning one of these strings instead of
+# raising, so callers that need to distinguish success from failure (e.g.
+# /megaphone, which otherwise always claimed "Sent" even when the server
+# was asleep and nothing actually reached it) must check against this set.
+_RCON_ERROR_STRINGS = frozenset({
+    "RCON timed out — server may be starting or unresponsive.",
+    "RCON auth failed — check MC_RCON_PASSWORD.",
+    "Can't reach RCON — is enable-rcon=true and 25575 published?",
+})
+
 
 async def rcon(cmd: str) -> str:
     try:
@@ -364,7 +374,10 @@ async def unlink_cmd(interaction: discord.Interaction):
 async def say_cmd(interaction: discord.Interaction, message: str):
     await interaction.response.defer()
     who = interaction.user.display_name
-    await rcon(f"say [{who}] {message}")
+    resp = await rcon(f"say [{who}] {message}")
+    if resp in _RCON_ERROR_STRINGS:
+        await interaction.followup.send(resp)
+        return
     await interaction.followup.send(f"Sent: `[{who}] {message}`")
 
 @client.tree.command(name="where", description="get live player coordinates")
