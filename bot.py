@@ -10,6 +10,10 @@ Env vars (see .env.example):
     GUILD_ID        your server's ID - scopes commands to it so they
                     appear instantly instead of taking up to an hour
     TRN_API_KEY     Tracker.gg developer key
+
+Two-way MC chat bridge (see .env.example): set MC_CHAT_CHANNEL_ID to the
+Discord channel to mirror chat in both directions. Requires the "Message
+Content" privileged intent enabled on the Bot page in the Developer Portal.
 """
 
 import json
@@ -33,6 +37,17 @@ MC_SSH_KEY = os.getenv("MC_SSH_KEY", "/wake_key")
 MC_CONTAINER = os.getenv("MC_CONTAINER", "minecraft")
 MC_WAKE_KEY = os.getenv("MC_WAKE_KEY", "/wake_key")
 LINKS_PATH = Path("/data/links.json")
+
+# Two-way Discord <-> Minecraft chat bridge. "0" = disabled.
+MC_CHAT_CHANNEL_ID = int(os.getenv("MC_CHAT_CHANNEL_ID", "0"))
+MC_CHAT_LOG_PATH = os.getenv("MC_CHAT_LOG_PATH", "/root/minecraft-server/data/logs/latest.log")
+MC_BRIDGE_JOIN_LEAVE = os.getenv("MC_BRIDGE_JOIN_LEAVE", "true").lower() == "true"
+# stop_key is unrestricted (unlike the forced-command wake_key), so it's the
+# one that can run an arbitrary `tail -F` instead of just `docker start`.
+MC_BRIDGE_SSH_KEY = os.getenv("MC_BRIDGE_SSH_KEY", "/stop_key")
+
+CHAT_LINE_RE = re.compile(r"^\[\d{2}:\d{2}:\d{2}\] \[[^\]]*\]: <([^>]+)> (.*)$")
+JOIN_LEAVE_RE = re.compile(r"^\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (\S+) (joined|left) the game$")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -104,9 +119,13 @@ class TrackerError(Exception):
 
 class RLBot(discord.Client):
     def __init__(self):
-        # This bot only uses slash commands, so it needs no privileged
-        # intents. Keeping them off means nothing to enable in the portal.
-        super().__init__(intents=discord.Intents.default() | discord.Intents(members=True))
+        # message_content is a privileged intent needed to read chat text
+        # for the MC bridge — must also be enabled on the Bot page in the
+        # Developer Portal, or on_message sees empty content.
+        super().__init__(
+            intents=discord.Intents.default()
+            | discord.Intents(members=True, message_content=True)
+        )
         self.tree = app_commands.CommandTree(self)
         self.session: aiohttp.ClientSession | None = None
 
@@ -115,6 +134,9 @@ class RLBot(discord.Client):
             timeout=aiohttp.ClientTimeout(total=15),
             headers={"TRN-Api-Key": TRN_API_KEY, "Accept": "application/json"},
         )
+
+        if MC_CHAT_CHANNEL_ID:
+            self.loop.create_task(mc_chat_bridge())
 
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
@@ -133,8 +155,75 @@ class RLBot(discord.Client):
     async def on_ready(self):
         log.info("Logged in as %s (id %s)", self.user, self.user.id)
 
+    async def on_message(self, message: discord.Message):
+        if message.author.bot:
+            return
+        if not MC_CHAT_CHANNEL_ID or message.channel.id != MC_CHAT_CHANNEL_ID:
+            return
+
+        # clean_content resolves @mentions/#channels to readable names.
+        text = message.clean_content.strip().replace("\n", " ")
+        if not text:
+            if not message.attachments:
+                return
+            text = "[attachment]"
+        text = text[:400]
+
+        who = message.author.display_name
+        payload = json.dumps({"text": f"[Discord] {who}: {text}", "color": "aqua"})
+        await rcon(f"tellraw @a {payload}")
+
 
 client = RLBot()
+
+
+async def _bridge_send(text: str) -> None:
+    channel = client.get_channel(MC_CHAT_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(MC_CHAT_CHANNEL_ID)
+        except discord.HTTPException as e:
+            log.warning("mc bridge: can't reach channel %s: %s", MC_CHAT_CHANNEL_ID, e)
+            return
+    await channel.send(text)
+
+
+async def mc_chat_bridge():
+    """Tails the Paper log over SSH and mirrors chat (and join/leave) into
+    Discord. `tail -F` follows by filename, so it survives lazymc putting the
+    container to sleep and waking it back up — only an actual SSH drop needs
+    a reconnect."""
+    await client.wait_until_ready()
+    log.info("mc chat bridge starting, channel=%s", MC_CHAT_CHANNEL_ID)
+
+    while not client.is_closed():
+        try:
+            async with asyncssh.connect(
+                MC_SSH_HOST,
+                username=MC_SSH_USER,
+                client_keys=[MC_BRIDGE_SSH_KEY],
+                known_hosts=None,
+            ) as conn:
+                async with conn.create_process(f"tail -F -n0 {MC_CHAT_LOG_PATH}") as proc:
+                    async for line in proc.stdout:
+                        line = line.rstrip("\n")
+
+                        m = CHAT_LINE_RE.match(line)
+                        if m:
+                            name, msg = m.groups()
+                            await _bridge_send(f"**<{name}>** {msg}")
+                            continue
+
+                        if MC_BRIDGE_JOIN_LEAVE:
+                            jm = JOIN_LEAVE_RE.match(line)
+                            if jm:
+                                name, verb = jm.groups()
+                                emoji = "➡️" if verb == "joined" else "⬅️"
+                                await _bridge_send(f"{emoji} *{name} {verb} the game*")
+        except Exception as e:
+            log.warning("mc chat bridge disconnected, retrying in 15s: %s", e)
+
+        await asyncio.sleep(15)
 
 
 async def fetch_profile(platform: str, name: str) -> dict:
