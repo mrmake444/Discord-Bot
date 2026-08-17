@@ -20,17 +20,13 @@ import logging
 import os
 import aiohttp
 import discord
-from datetime import datetime, timezone
-from discord.ext import tasks
-from pathlib import Path
 from discord import app_commands
-from mcstatus import JavaServer
+from pathlib import Path
 from aiomcrcon import Client, RCONConnectionError, IncorrectPasswordError
 
 MC_HOST = os.getenv("MC_HOST", "192.168.1.183")
 MC_RCON_PORT = int(os.getenv("MC_RCON_PORT", "25575"))
 MC_RCON_PASSWORD = os.getenv("MC_RCON_PASSWORD")
-MC_PORT = int(os.getenv("MC_PORT", "25565"))
 MC_SSH_HOST = os.getenv("MC_SSH_USER", MC_HOST)
 MC_SSH_USER = os.getenv("MC_SSH_USER", "root")
 MC_SSH_KEY = os.getenv("MC_SSH_KEY", "/wake_key")
@@ -46,10 +42,6 @@ log = logging.getLogger("rlbot")
 TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = os.getenv("GUILD_ID")
 
-# Minutes the server must sit empty before it gets stopped
-EMPTY_SHUTDOWN_MINUTES = int(os.getenv("MC_EMPTY_SHUTDOWN_MINUTES", "15"))
-# How often to poll player count
-CHECK_INTERVAL_MINUTES = int(os.getenv("MC_CHECK_INTERVAL_MINUTES", "2"))
 # Optional: channel to announce shutdowns in. "0" = stay silent.
 MC_ANNOUNCE_CHANNEL_ID = int(os.getenv("MC_ANNOUNCE_CHANNEL_ID", "616023990921723954"))
 
@@ -73,18 +65,6 @@ def parse_pos(resp: str) -> str | None:
         return None
     x, y, z = (round(float(n)) for n in nums)
     return f"X: {x}  Y: {y}  Z: {z}"
-
-async def rcon(cmd: str) -> str:
-    try:
-        async with Client(MC_HOST, MC_RCON_PORT, MC_RCON_PASSWORD) as c:
-            resp, _ = await asyncio.wait_for(c.send_cmd(cmd), timeout=5)
-            return resp or "(no output)"
-    except asyncio.TimeoutError:
-        return "RCON timed out."
-    except IncorrectPasswordError:
-        return "RCON auth failed."
-    except RCONConnectionError:
-        return "Can't reach RCON."
 
 TRN_API_KEY = os.getenv("TRN_API_KEY", "046ef1ba-317b-4f63-9642-e58570b9a7d0")
 
@@ -152,8 +132,6 @@ class RLBot(discord.Client):
 
     async def on_ready(self):
         log.info("Logged in as %s (id %s)", self.user, self.user.id)
-        if not idle_shutdown_watcher.is_running():
-            idle_shutdown_watcher.start()
 
 
 client = RLBot()
@@ -311,17 +289,31 @@ async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(f"Up. {latency} ms to Discord.")
 
 
- 
-_empty_since = None  # datetime | None
 
-async def _mc_player_count():
-    """Returns online player count, or None if the server is unreachable/offline."""
+_LIST_RE = re.compile(r"There are (\d+) of a max of \d+ players online:?\s*(.*)")
+
+
+async def _mc_status():
+    """RCON reachability check. Returns the raw `list` command output if the
+    server is awake, or None if it's asleep/unreachable. Never trust port
+    25565 here — lazymc answers pings itself even while the container is
+    stopped, so a ping always looks "up"."""
     try:
-        server = await JavaServer.async_lookup(f"{MC_HOST}:{MC_PORT}")
-        status = await server.async_status()
-        return status.players.online
-    except Exception:
+        async with Client(MC_HOST, MC_RCON_PORT, MC_RCON_PASSWORD) as c:
+            resp, _ = await asyncio.wait_for(c.send_cmd("list"), timeout=5)
+            return resp
+    except (RCONConnectionError, asyncio.TimeoutError, IncorrectPasswordError):
         return None
+
+
+def _parse_list(resp: str) -> tuple[int, list[str]]:
+    m = _LIST_RE.search(resp or "")
+    if not m:
+        return 0, []
+    online = int(m.group(1))
+    names = [n.strip() for n in m.group(2).split(",") if n.strip()]
+    return online, names
+
 
 async def stop_minecraft_container(reason: str) -> str:
     """save-all over RCON, then `docker stop` over SSH. Returns a status message."""
@@ -361,40 +353,8 @@ async def stop_minecraft_container(reason: str) -> str:
     return msg
  
  
-# --- background watcher ----------------------------------------------------
-@tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
-async def idle_shutdown_watcher():
-    global _empty_since
- 
-    online = await _mc_player_count()
- 
-    if online is None:          # server already down — nothing to do
-        _empty_since = None
-        return
-    if online > 0:              # someone's playing — reset the clock
-        _empty_since = None
-        return
- 
-    now = datetime.now(timezone.utc)
-    if _empty_since is None:
-        _empty_since = now
-        print(f"[mc-shutdown] Server empty — {EMPTY_SHUTDOWN_MINUTES}m countdown started")
-        return
- 
-    idle_minutes = (now - _empty_since).total_seconds() / 60
-    if idle_minutes >= EMPTY_SHUTDOWN_MINUTES:
-        await stop_minecraft_container(f"empty for {EMPTY_SHUTDOWN_MINUTES} minutes")
-        _empty_since = None
- 
- 
-@idle_shutdown_watcher.before_loop
-async def _before_idle_watcher():
-    await client.wait_until_ready()
- 
 async def start_minecraft_container(reason: str) -> str:
     """Starts the container via the forced-command wake key."""
-    global _empty_since
- 
     try:
         async with asyncssh.connect(
             MC_SSH_HOST,
@@ -404,124 +364,87 @@ async def start_minecraft_container(reason: str) -> str:
         ) as conn:
             # Argument is ignored — authorized_keys forces `docker start minecraft`
             result = await conn.run("start", check=False)
- 
+
         if result.exit_status == 0:
             msg = (
                 f"▶️ Minecraft server starting ({reason}) — "
                 "give it 30-60s before connecting."
             )
-            # Reset the idle clock so the watcher doesn't stop a server that
-            # was just started but hasn't had time for anyone to join.
-            _empty_since = None
         else:
             err = (result.stderr or "").strip() or f"exit {result.exit_status}"
             msg = f"⚠️ Start failed: {err}"
     except Exception as e:
         msg = f"⚠️ Couldn't reach the Minecraft host over SSH: {e}"
- 
+
     print(f"[mc-start] {msg}")
     return msg
- 
- 
+
+
 # --- /start command --------------------------------------------------------
 @client.tree.command(name="start", description="Start the Minecraft server")
 async def start_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
- 
-    if await _mc_player_count() is not None:
+
+    if await _mc_status() is not None:
         await interaction.followup.send("Server is already up.")
         return
- 
+
     result = await start_minecraft_container(f"manual, by {interaction.user.display_name}")
     await interaction.followup.send(result)
- 
- 
-# --- buttons for /mcstatus -------------------------------------------------
+
+
+# --- button for /mcstatus ---------------------------------------------------
 class _StartButton(discord.ui.Button):
     def __init__(self):
         super().__init__(label="Start server", style=discord.ButtonStyle.success, emoji="▶️")
- 
+
     async def callback(self, interaction: discord.Interaction):
         self.disabled = True
         await interaction.response.edit_message(view=self.view)
         msg = await start_minecraft_container(f"button, by {interaction.user.display_name}")
         await interaction.followup.send(msg)
- 
- 
-class _StopButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(label="Shut it down", style=discord.ButtonStyle.danger, emoji="🛑")
- 
-    async def callback(self, interaction: discord.Interaction):
-        # Re-check first — someone may have joined since the status was posted
-        online = await _mc_player_count()
-        if online:
-            await interaction.response.send_message(
-                f"⚠️ {online} player(s) joined since then — leaving it up.", ephemeral=True
-            )
-            return
- 
-        self.disabled = True
-        await interaction.response.edit_message(view=self.view)
-        msg = await stop_minecraft_container(f"button, by {interaction.user.display_name}")
-        await interaction.followup.send(msg)
- 
- 
-# --- REPLACE your existing /mcstatus with this -----------------------------
+
+
+# --- /mcstatus command -------------------------------------------------
 @client.tree.command(name="mcstatus", description="Minecraft server status")
 async def mcstatus_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
- 
-    try:
-        server = await JavaServer.async_lookup(f"{MC_HOST}:{MC_PORT}")
-        s = await server.async_status()
-    except Exception as e:
+
+    resp = await _mc_status()
+    if resp is None:
         view = discord.ui.View(timeout=180)
         view.add_item(_StartButton())
-        await interaction.followup.send(f"Server appears offline ({e})", view=view)
-        return
- 
-    names = ", ".join(p.name for p in (s.players.sample or [])) or "nobody"
-    text = (
-        f"**Online:** {s.players.online}/{s.players.max}\n"
-        f"**Players:** {names}\n"
-        f"**Version:** {s.version.name} — {s.latency:.0f}ms"
-    )
- 
-    if s.players.online == 0:
-        view = discord.ui.View(timeout=180)
-        view.add_item(_StopButton())
-        idle_note = ""
-        if _empty_since is not None:
-            mins_left = EMPTY_SHUTDOWN_MINUTES - (
-                datetime.now(timezone.utc) - _empty_since
-            ).total_seconds() / 60
-            if mins_left > 0:
-                idle_note = f" Auto-shutdown in ~{mins_left:.0f} min."
         await interaction.followup.send(
-            f"{text}\n\nNobody's playing.{idle_note}", view=view
+            "Server is asleep — nobody's connected. lazymc will spin it up "
+            "when someone joins, or use the button below.",
+            view=view,
         )
-    else:
-        await interaction.followup.send(text)
- 
+        return
+
+    online, names = _parse_list(resp)
+    names_text = ", ".join(names) if names else "nobody"
+    text = f"**Online:** {online}\n**Players:** {names_text}"
+    await interaction.followup.send(text)
+
 # --- /shutdown command -----------------------------------------------------
 @client.tree.command(name="shutdown", description="Stop the Minecraft server")
 async def shutdown_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
- 
-    online = await _mc_player_count()
- 
-    if online is None:
+
+    resp = await _mc_status()
+
+    if resp is None:
         await interaction.followup.send("Server already appears to be offline.")
         return
- 
+
+    online, _ = _parse_list(resp)
     if online > 0:
         await interaction.followup.send(
             f"⚠️ {online} player(s) still online — not stopping. "
-            "Use `/mcstatus` to see who, or wait for the idle timer."
+            "Use `/mcstatus` to see who."
         )
         return
- 
+
     result = await stop_minecraft_container(f"manual, by {interaction.user.display_name}")
     await interaction.followup.send(result)
 
