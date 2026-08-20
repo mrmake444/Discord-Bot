@@ -124,9 +124,25 @@ minimum_online_time=120, start_timeout=300.
   26.2, actively maintained) does all the actual per-player
   rendering — its `scoreboard`/`header-footer` sections in
   `/data/plugins/TAB/config.yml` are templated with `%skhud_line_N%`
-  / `%skhud_title%` (sidebar) and `%skhud_footer_N%` (tab-press full
-  coordinates), config also mirrored at data/tab-config.yml in this
-  repo. Rebuild skhud-bridge: `cd /root/skhud-bridge && mvn package`,
+  / `%skhud_title%` (sidebar) and `%skhud_footer%` / `%skhud_header%`
+  (tab-press full coordinates), config also mirrored at
+  data/tab-config.yml in this repo.
+  - **The two halves collapse differently when empty, and this is the
+    whole reason for that `%skhud_footer%` key.** TAB's sidebar drops
+    a line whose placeholder is empty (`StableDynamicLine` calls
+    `removeLine`), so `%skhud_line_1..10%` can be listed freely and
+    the sidebar sizes itself. Header/footer does NOT: it is a plain
+    `String.join("\n", configuredLines)` with no filtering, so the
+    twelve `%skhud_footer_N%` slots it used to list drew twelve
+    blank lines — the "huge transparent tab box" bug (fixed
+    2026-08-19). skhud-bridge therefore serves a computed `footer`
+    key joining footer_1..N up to the first gap, so the config lists
+    one slot. Do not add per-line footer slots back.
+  - Because TAB always draws the sidebar title and the header even
+    when everything under them is empty, hud.sk only sets the
+    `title`/`header` keys when the HUD actually has content —
+    otherwise an empty HUD showed a bare "HUD" heading over nothing.
+  Rebuild skhud-bridge: `cd /root/skhud-bridge && mvn package`,
   deploy the resulting target/skhud-bridge.jar, restart (new/changed
   Java always needs a restart, unlike .sk files).
 - Skript 2.16.1 (plugins/Skript.jar) — event-driven scripting without
@@ -157,12 +173,35 @@ minimum_online_time=120, start_timeout=300.
     runs, and `tickHud()` which builds each player's sidebar/footer
     content and pushes it via `skhudset`. Multiple pins and/or
     tracked players can be active at once, each shown as
-    "<name> <compass dir> <distance>"; an entry auto-removes once
+    "<name> <compass dir> <distance>". **/pin takes either a saved
+    location or a player** and routes to `{pins::*}` or `{track::*}`
+    accordingly (`hudAdd`/`hudRemove`); /track and /untrack are just
+    the explicit player-only spelling. It used to be location-only,
+    which is why pinning a player appeared to do nothing at all —
+    players kept typing /pin for players, since the HUD draws both
+    kinds of entry identically. The player branch requires `is
+    online` or `has played before`: `parsed as offline player`
+    returns a real OfflinePlayer for any syntactically valid name
+    (verified — "house" yields a never-seen player named "House",
+    while a 17-char name is rejected for length), so without that
+    check a typo'd location name became a permanent phantom HUD
+    entry. An entry auto-removes once
     you're within 5 blocks unless added with the "permanent" keyword
     (`/pin home permanent`, `/track Steve permanent`). Full exact
     coordinates for every active pin/tracked-player show on
     tab-press (TAB's header/footer), not in the compact sidebar.
-  - race.sk, tint.sk, shopsigninfo.sk, mccommands.sk — unchanged in
+  - mccommands.sk — hardcoded in-game mirror of bot.py's
+    `_MINECRAFT_COMMANDS`, kept in sync by hand. **Known dead code:**
+    bot.py's `push_mccommands()` (fired from `setup_hook`) RCONs
+    `clearmccommandsmc` / `setmccommandsmc` to replace that hand-sync
+    with a pushed `{mccommands::*}` variable, but neither command is
+    implemented in any .sk — the calls just return "Unknown command"
+    and the comment claiming /mccommands is pushed rather than
+    hand-copied is wrong. Either implement the two console-only
+    commands (and have the bot translate its Discord markdown to
+    legacy color codes on the way in) or delete `push_mccommands`;
+    until then treat the two lists as a manual sync point.
+  - race.sk, tint.sk, shopsigninfo.sk — unchanged in
     structure; race.sk's fall-death check was extracted from its own
     "every 1 second" into `tickRaceFall()`, called from clock.sk.
   - joinmessage.sk (source of truth: data/joinmessage.sk in this
