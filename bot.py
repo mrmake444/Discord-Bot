@@ -89,10 +89,6 @@ class RLBot(discord.Client):
         if mc.MC_CHAT_CHANNEL_ID:
             self.loop.create_task(mc.mc_chat_bridge())
 
-        # Best-effort — no-ops harmlessly (unknown command) if the server's
-        # asleep or hud.sk isn't deployed yet.
-        self.loop.create_task(push_mccommands())
-
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
             self.tree.copy_global_to(guild=guild)
@@ -597,8 +593,12 @@ async def shutdown_cmd(interaction: discord.Interaction):
 # command tree vs Bukkit's command map inside the Skript/Essentials plugins),
 # so there's no single source to query both from. Keep this in sync by hand
 # when commands are added/removed/permission changes on either side. The
-# Minecraft section is pushed to the server at startup (see push_mccommands
-# below) rather than hand-copied, so /mccommands in-game always matches this.
+# Minecraft section has TWO more hand-kept copies: mccommands.sk deployed on
+# CT 101 (what /mccommands actually prints in game) and data/mccommands.sk
+# here. An auto-push of this text over RCON used to live here; it was removed
+# 2026-08-20 because the console commands it called (setmccommandsmc /
+# clearmccommandsmc) were never implemented in any deployed script, so it had
+# only ever sent unknown-command no-ops. Edit all three copies together.
 _DISCORD_COMMANDS = """**Discord**
 `/rlstats <platform> <player>` — everyone
 `/link <username>` / `/unlink` — everyone
@@ -622,6 +622,11 @@ _MINECRAFT_COMMANDS = """**Minecraft (in-game chat)**
 `/find [player] [name]` / `/locations [player]` — everyone
 `/shophelp` / `/mccommands` — everyone
 `/balance` (`/bal`) / `/balancetop` / `/pay <player> <amount>` — everyone
+`/moneyhelp` (`/earn`) — everyone, how money is earned, lost and gambled
+`/daily` — everyone, the once-a-day payout
+`/casino` / `/bet <racer> <amount>` / `/lotto [buy <n>]` — everyone
+`/race` / `/start` / `/raceleave` — everyone, the ice boat race
+`/casinoadmin add\\|take\\|set <amount>` — op only, the house bankroll
 Shop signs (ChestShop) — everyone, no command — see the shop sign format below
 Sneak + right-click glass — cycles its color, then tinted glass, then back to plain (no command)
 `/eco give\\|take\\|set <player> <amount>` — op only
@@ -674,17 +679,6 @@ async def commands_cmd(interaction: discord.Interaction):
 async def mccommands_cmd(interaction: discord.Interaction):
     embed = discord.Embed(description=f"{_MINECRAFT_COMMANDS}\n\n{_SHOP_SIGN}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-async def push_mccommands() -> None:
-    """Pushes _MINECRAFT_COMMANDS to the server as a stored Skript variable,
-    so in-game /mccommands (hud.sk) always matches this file instead of a
-    hand-copied duplicate. One RCON line per line of text — setmccommandsmc
-    (console-only) appends rather than replacing, so it's cleared first."""
-    lines = _MINECRAFT_COMMANDS.replace("\\|", "|").split("\n")
-    await mc.rcon("clearmccommandsmc")
-    for line in lines:
-        await mc.rcon(f"setmccommandsmc {line}")
 
 
 if __name__ == "__main__":
