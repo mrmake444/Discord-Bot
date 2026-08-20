@@ -3,6 +3,8 @@ Rocket League stats bot.
 
 Slash commands:
     /rlstats <platform> <player>   current ranks from Tracker.gg
+    /economy                       how the in-game money system works
+    /request <feature>             ask for a feature; /requests lists them
     /ping                          liveness check
 
 Env vars (see .env.example):
@@ -25,6 +27,7 @@ import asyncio
 import json
 import logging
 import os
+from datetime import datetime, timezone
 
 import aiohttp
 import discord
@@ -600,38 +603,62 @@ async def shutdown_cmd(interaction: discord.Interaction):
 # clearmccommandsmc) were never implemented in any deployed script, so it had
 # only ever sent unknown-command no-ops. Edit all three copies together.
 _DISCORD_COMMANDS = """**Discord**
-`/rlstats <platform> <player>` — everyone
-`/link <username>` / `/unlink` — everyone
-`/find [player] [name]` — everyone
-`/setlocation <name> [color]` / `/removelocation <name>` — everyone, requires `/link` first
-`/locations [player]` — everyone
-`/joinmessage <text>` / `/removejoinmessage` — everyone, requires `/link` first
-`/map [player] [x] [z]` — everyone
-`/mcstatus` / `/tps` / `/ping` — everyone
-`/start` / `/shutdown` — everyone
-`/megaphone <message>` — requires the **Minecraft** Discord role
-`/clear [amount]` — requires **Manage Messages** permission
-`/commands` / `/mccommands` — everyone"""
+-# Everyone, unless marked otherwise.
+
+__Minecraft server__
+`/mcstatus` · `/tps` · `/start` · `/shutdown`
+`/megaphone <message>` — needs the **Minecraft** role
+
+__Map and locations__
+`/map [player] [x] [z]` · `/find [player] [name]` · `/locations [player]`
+`/setlocation <name> [color]` · `/removelocation <name>` — `/link` first
+
+__Your account__
+`/link <username>` · `/unlink`
+`/joinmessage <text>` · `/removejoinmessage` — `/link` first
+
+__Rocket League__
+`/rlstats <platform> <player>`
+
+__Help__
+`/commands` · `/mccommands` · `/economy`
+
+__Feature requests__
+`/request <feature>` · `/requests [include_done]`
+`/requestdone <id> [note]` — needs **Manage Messages**
+
+__Housekeeping__
+`/ping` · `/clear [amount]` — `/clear` needs **Manage Messages**"""
 
 _MINECRAFT_COMMANDS = """**Minecraft (in-game chat)**
-`/setlocation <name> [color]` / `/removelocation <name>` — everyone
-`/pin <name\\|player> [permanent]` / `/unpin <name\\|player>` — everyone, takes a saved location or a player
-`/track <player> [permanent]` / `/untrack <player>` — everyone, the player-only spelling of `/pin`
-`/hidepins` — everyone, toggles pins off the sidebar; they stay on Tab
-`/sethome` (Essentials) — everyone, also pins "home" on the HUD automatically
-`/find [player] [name]` / `/locations [player]` — everyone
-`/shophelp` / `/mccommands` — everyone
-`/balance` (`/bal`) / `/balancetop` / `/pay <player> <amount>` — everyone
-`/moneyhelp` (`/earn`) — everyone, how money is earned, lost and gambled
-`/daily` — everyone, the once-a-day payout
-`/casino` / `/bet <racer> <amount>` / `/lotto [buy <n>]` — everyone
-`/race` / `/start` / `/raceleave` — everyone, the ice boat race
-`/casinoadmin add\\|take\\|set <amount>` — op only, the house bankroll
-Shop signs (ChestShop) — everyone, no command — see the shop sign format below
-Sneak + right-click glass — cycles its color, then tinted glass, then back to plain (no command)
-`/eco give\\|take\\|set <player> <amount>` — op only
-`/op` / `/deop` / `/lp ...` (LuckPerms) — op / console only
-WorldEdit (`//wand`, `//set`, etc.) — op / builder only, not itemized here"""
+-# Everyone, unless marked otherwise.
+
+__Money__
+`/balance` (`/bal`) · `/balancetop` · `/pay <player> <amount>`
+`/moneyhelp` (`/earn`) how it all works · `/daily` once-a-day payout
+Shop signs (ChestShop) — no command; format below
+
+__Gambling and racing__
+`/casino` · `/bet <racer> <amount>` · `/lotto [buy <n>]`
+`/race` · `/start` · `/raceleave` — the ice boat race
+
+__Locations, pins and the map__
+`/setlocation <name> [color]` · `/removelocation <name>` · `/locations [player]`
+`/find [player] [name]` — where someone is, or one of their spots
+`/pin <name|player> [permanent]` · `/unpin <name|player>` — sidebar marker
+`/track <player> [permanent]` · `/untrack <player>` — the player-only `/pin`
+`/hidepins` — takes pins off the sidebar; they stay on Tab
+`/sethome` (Essentials) — also pins home on your HUD
+
+__Help and odds and ends__
+`/mccommands` · `/shophelp`
+Sneak + right-click glass — cycles color, then tinted, then plain
+
+__Op only__
+`/casinoadmin add|take|set <amount>` — the house bankroll
+`/eco give|take|set <player> <amount>`
+`/op` · `/deop` · `/lp ...` (LuckPerms) — op / console
+WorldEdit (`//wand`, `//set`, etc.) — op / builder, not itemized here"""
 
 # Values match this server's ChestShop config: REVERSE_BUTTONS false (so
 # right-click buys, left-click sells), ALLOW_AUTO_ITEM_FILL true (line 4
@@ -653,6 +680,40 @@ On `line 3`, `B` is what a customer pays to **buy** from you and `S` is what you
 Right-click the sign to buy, left-click to sell. Shops are free to make, and the chest is \
 protected as soon as the sign goes up."""
 
+# Mirrors in-game /moneyhelp (income.sk on CT 101), which is the real
+# source of these numbers — it reads most of them straight from the options
+# the payout code uses. Kept as static text rather than fetched over RCON so
+# it still answers while the server is asleep under lazymc. If you retune
+# anything in income.sk, update this too.
+_ECONOMY = """**How money works in game**
+One currency, shared by shop signs, `/pay` and the casino. Check yours with \
+`/balance`, the rich list with `/balancetop`.
+
+**Earning**
+`/daily` — $50, once every 24 hours
+Kill hostile mobs — $5 common, $12 tough, up to $250 a boss
+Mine ore — $1-$15 a block, best on emerald and ancient debris
+Win a race — $200 from the house (`/race` in game)
+Kill a player — 10% of their money, capped at $500
+First join — a one-off $100 welcome bonus
+
+**Losing**
+Taking a hit from a mob — $1 a hit, which funds the race prize pot
+Taking a hit from a player — $2, straight into their pocket
+Fines stop at $0. Nothing in the economy can put you into debt.
+
+**Gambling** — `/casino` in game
+Back a racer with `/bet <racer> <amount>` while people queue for a race, or \
+buy lottery tickets with `/lotto buy <n>`. The house takes 5%; everything \
+else in the pot is other players' stakes, split between whoever backed the \
+winner.
+
+The 5% rake and the mob fines go to the house bankroll, and race prizes are \
+paid out of it — that money is recycled rather than destroyed. Ore you placed \
+yourself pays nothing when you break it again.
+
+Run `/moneyhelp` in game for this same list."""
+
 _COMMAND_REFERENCE = f"""
 {_DISCORD_COMMANDS}
 
@@ -673,6 +734,119 @@ bridge commands aren't directly runnable by anyone and are left off this list.
 async def commands_cmd(interaction: discord.Interaction):
     embed = discord.Embed(description=_COMMAND_REFERENCE)
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@client.tree.command(name="economy", description="How the in-game money system works")
+async def economy_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(description=_ECONOMY)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# Feature requests. Deliberately public rather than ephemeral: the point is
+# that everyone can see what has been asked for (and react to it) instead of
+# the same idea arriving five times. /requests is the ephemeral one, since
+# re-reading the backlog shouldn't clutter the channel.
+REQUEST_MAX_LEN = 500
+REQUEST_LIST_LIMIT = 20
+
+
+@client.tree.command(name="request", description="Ask for a feature to be added")
+@app_commands.describe(feature=f"What you'd like added or changed (max {REQUEST_MAX_LEN} chars)")
+async def request_cmd(interaction: discord.Interaction, feature: str):
+    await interaction.response.defer()
+
+    text = " ".join(feature.split())
+    if not text:
+        await interaction.followup.send("Say what you'd like added.", ephemeral=True)
+        return
+    if len(text) > REQUEST_MAX_LEN:
+        await interaction.followup.send(
+            f"That's too long ({len(text)}/{REQUEST_MAX_LEN} chars) — trim it and try again.",
+            ephemeral=True,
+        )
+        return
+
+    requests = storage.load_requests()
+    items = requests.get("items", [])
+    req_id = requests.get("next_id", 1)
+
+    items.append({
+        "id": req_id,
+        "user_id": str(interaction.user.id),
+        "user_name": interaction.user.display_name,
+        "text": text,
+        "created": int(datetime.now(timezone.utc).timestamp()),
+        "done": False,
+        "closed_by": None,
+        "note": None,
+    })
+    storage.save_requests({"next_id": req_id + 1, "items": items})
+    log.info("feature request #%s from %s: %s", req_id, interaction.user, text)
+
+    await interaction.followup.send(
+        f"📝 **Request #{req_id}** from {interaction.user.mention}\n{text}\n"
+        f"-# `/requests` to see everything asked for so far."
+    )
+
+
+@client.tree.command(name="requests", description="List the features people have asked for")
+@app_commands.describe(include_done="Also show requests already marked done (default false)")
+async def requests_cmd(interaction: discord.Interaction, include_done: bool = False):
+    requests = storage.load_requests()
+    items = requests.get("items", [])
+    if not include_done:
+        items = [i for i in items if not i.get("done")]
+
+    if not items:
+        await interaction.response.send_message(
+            "Nothing requested yet — `/request <feature>` starts the list.", ephemeral=True
+        )
+        return
+
+    # Newest first, capped: an embed description tops out at 4096 characters
+    # and a long backlog would otherwise fail to send at all.
+    shown = list(reversed(items))[:REQUEST_LIST_LIMIT]
+    lines = []
+    for i in shown:
+        mark = "✅" if i.get("done") else "•"
+        line = f"{mark} **#{i['id']}** {i['text']}\n-# {i.get('user_name', 'someone')}"
+        if i.get("created"):
+            line += f" · <t:{i['created']}:R>"
+        if i.get("done") and i.get("note"):
+            line += f" · done: {i['note']}"
+        lines.append(line)
+
+    body = "\n".join(lines)
+    hidden = len(items) - len(shown)
+    if hidden > 0:
+        body += f"\n-# ...and {hidden} older one(s) not shown."
+
+    embed = discord.Embed(title="Feature requests", description=body)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@client.tree.command(name="requestdone", description="Mark a feature request as done")
+@app_commands.describe(id="The request number, as shown by /requests", note="Optional note about what shipped")
+@app_commands.default_permissions(manage_messages=True)
+async def requestdone_cmd(interaction: discord.Interaction, id: int, note: str = None):
+    requests = storage.load_requests()
+    items = requests.get("items", [])
+
+    target = next((i for i in items if i.get("id") == id), None)
+    if target is None:
+        await interaction.response.send_message(f"No request #{id}.", ephemeral=True)
+        return
+    if target.get("done"):
+        await interaction.response.send_message(f"#{id} is already marked done.", ephemeral=True)
+        return
+
+    target["done"] = True
+    target["closed_by"] = interaction.user.display_name
+    target["note"] = " ".join(note.split()) if note else None
+    storage.save_requests({"next_id": requests.get("next_id", len(items) + 1), "items": items})
+
+    tail = f" — {target['note']}" if target["note"] else ""
+    await interaction.response.send_message(f"✅ Marked #{id} done{tail}.")
 
 
 @client.tree.command(name="mccommands", description="List only the Minecraft in-game commands")

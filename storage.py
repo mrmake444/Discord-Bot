@@ -10,6 +10,7 @@ from pathlib import Path
 LINKS_PATH = Path("/data/links.json")
 LOCATIONS_PATH = Path("/data/locations.json")
 JOINMESSAGES_PATH = Path("/data/joinmessages.json")
+REQUESTS_PATH = Path("/data/requests.json")
 
 
 def load_json(path: Path) -> dict:
@@ -50,3 +51,14 @@ def load_joinmessages() -> dict:
 
 def save_joinmessages(messages: dict) -> None:
     save_json(JOINMESSAGES_PATH, messages)
+
+
+def load_requests() -> dict:
+    """{ "next_id": int, "items": [ {id, user_id, user_name, text, created,
+    done, closed_by, note} ] } — an empty dict on first run, so callers must
+    use .get() with defaults rather than assuming the keys exist."""
+    return load_json(REQUESTS_PATH)
+
+
+def save_requests(requests: dict) -> None:
+    save_json(REQUESTS_PATH, requests)
