@@ -203,6 +203,26 @@ minimum_online_time=120, start_timeout=300.
     Verified that the `is a shield` comparison also matches enchanted
     and damaged shields (the alias carries no meta) and does not
     false-positive on other items.
+    - Sounds: everyone gets `item.shield.block` played `to` them
+      (private); frazzleddrippp gets a six-shot
+      `entity.firework_rocket.blast` burst played `at` him, so players
+      in earshot hear it. There is no gunshot sound in vanilla — that
+      blast at pitch 2 is the sharpest crack available without a
+      resource pack every player would have to accept.
+    - **The burst lives in a console-only `/dfgunshots` command, and
+      must stay there.** It needs `wait`s between shots, and Skript's
+      `wait` suspends the *calling* trigger — inside tickDoubleFist
+      that would suspend clock.sk's whole `loop all players`, stalling
+      every other player's HUD for the length of the burst. Dispatching
+      a command starts a separate trigger, so the delay is contained.
+      Skript 2.16.1 has no delayed-section effect (only `Delay`), so
+      there is no tidier way to do this.
+    - Gotcha hit while writing it: inserting that command between the
+      function's `if` and its trailing `else` orphaned the `else`
+      ("Unexpected entry 'else'"), which unloads the script and leaves
+      clock.sk calling a function that no longer exists. `sk reload`
+      errors go to the RCON sender, not the console log — pipe through
+      `cat -v` and strip colour codes to read them.
   - locations.sk — /setlocation, /removelocation, /find, /locations,
     plus /setlocationmc, /removelocationmc (console-only, RCON-pushed
     from bot.py). Also prints LOCSYNC/LOCREMOVE to console (see the
