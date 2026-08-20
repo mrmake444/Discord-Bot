@@ -142,6 +142,20 @@ minimum_online_time=120, start_timeout=300.
     when everything under them is empty, hud.sk only sets the
     `title`/`header` keys when the HUD actually has content —
     otherwise an empty HUD showed a bare "HUD" heading over nothing.
+  - skhud-bridge also supplies **tab completion for /pin and /unpin**
+    via `AsyncTabCompleteEvent`. Skript cannot: its
+    `ScriptCommand.onTabComplete` returns `Collections.emptyList()` for
+    every argument type except `Player`/`OfflinePlayer` (those return
+    null, which is what makes Bukkit fall back to online player names),
+    and /pin's first argument has to be `<text>` to accept location
+    names — so /pin offered no suggestions at all once players were
+    folded into it. Candidates come from two more keys hud.sk pushes
+    each tick, `pinnable` (the player's saved location names) and
+    `pinned` (what's currently on their HUD), space-joined; online
+    player names are added to /pin's list in the plugin, from a
+    join/quit-maintained cache because the event fires off the main
+    thread. It hooks the event rather than the commands' TabCompleter
+    because Skript rebuilds its command objects on every `sk reload`.
   Rebuild skhud-bridge: `cd /root/skhud-bridge && mvn package`,
   deploy the resulting target/skhud-bridge.jar, restart (new/changed
   Java always needs a restart, unlike .sk files).
