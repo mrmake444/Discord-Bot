@@ -138,10 +138,19 @@ minimum_online_time=120, start_timeout=300.
     2026-08-19). skhud-bridge therefore serves a computed `footer`
     key joining footer_1..N up to the first gap, so the config lists
     one slot. Do not add per-line footer slots back.
-  - Because TAB always draws the sidebar title and the header even
-    when everything under them is empty, hud.sk only sets the
-    `title`/`header` keys when the HUD actually has content —
-    otherwise an empty HUD showed a bare "HUD" heading over nothing.
+  - Because TAB always draws the sidebar title even when every line
+    under it is empty, hud.sk only sets the `title` key when the
+    sidebar actually has content — otherwise an empty HUD showed a
+    bare "HUD" heading over nothing.
+  - The `header` key is the exception and **is** set unconditionally:
+    it carries the viewer's own rounded X/Y/Z plus a friendly
+    dimension name (Overworld/Nether/End, mapped from the raw
+    world/world_nether/world_the_end), which is useful with nothing
+    pinned. It is the only always-on part of the HUD, so an unpinned
+    player still gets exactly one header line on tab-press instead of
+    an empty box. It refreshes on clock.sk's 1s tick, so it trails
+    slightly while the player is moving — TAB's own 500ms
+    default-refresh-interval is not the limiting factor.
   - skhud-bridge also supplies **tab completion for /pin and /unpin**
     via `AsyncTabCompleteEvent`. Skript cannot: its
     `ScriptCommand.onTabComplete` returns `Collections.emptyList()` for
