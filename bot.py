@@ -14,119 +14,38 @@ Env vars (see .env.example):
 Two-way MC chat bridge (see .env.example): set MC_CHAT_CHANNEL_ID to the
 Discord channel to mirror chat in both directions. Requires the "Message
 Content" privileged intent enabled on the Bot page in the Developer Portal.
+
+Structure: this file is the Discord-facing half only — the RLBot class and
+every /command handler. Everything Minecraft-connectivity-related (RCON,
+container start/stop, the chat bridge + location sync) lives in mc.py;
+Tracker.gg lookups live in tracker.py; JSON persistence lives in storage.py.
 """
 
-import json
-import re
-import asyncssh
 import asyncio
+import json
 import logging
 import os
+
 import aiohttp
 import discord
 from discord import app_commands
-from pathlib import Path
-from aiomcrcon import Client, RCONConnectionError, IncorrectPasswordError
 
-MC_HOST = os.getenv("MC_HOST", "192.168.1.183")
-MC_RCON_PORT = int(os.getenv("MC_RCON_PORT", "25575"))
-MC_RCON_PASSWORD = os.getenv("MC_RCON_PASSWORD")
-MC_SSH_HOST = os.getenv("MC_SSH_USER", MC_HOST)
-MC_SSH_USER = os.getenv("MC_SSH_USER", "root")
-MC_SSH_KEY = os.getenv("MC_SSH_KEY", "/wake_key")
-MC_CONTAINER = os.getenv("MC_CONTAINER", "minecraft")
-MC_WAKE_KEY = os.getenv("MC_WAKE_KEY", "/wake_key")
-LINKS_PATH = Path("/data/links.json")
-
-# Two-way Discord <-> Minecraft chat bridge. "0" = disabled.
-MC_CHAT_CHANNEL_ID = int(os.getenv("MC_CHAT_CHANNEL_ID", "0"))
-MC_CHAT_LOG_PATH = os.getenv("MC_CHAT_LOG_PATH", "/root/minecraft-server/data/logs/latest.log")
-MC_BRIDGE_JOIN_LEAVE = os.getenv("MC_BRIDGE_JOIN_LEAVE", "true").lower() == "true"
-# stop_key is unrestricted (unlike the forced-command wake_key), so it's the
-# one that can run an arbitrary `tail -F` instead of just `docker start`.
-MC_BRIDGE_SSH_KEY = os.getenv("MC_BRIDGE_SSH_KEY", "/stop_key")
-
-CHAT_LINE_RE = re.compile(r"^\[\d{2}:\d{2}:\d{2}\] \[[^\]]*\]: <([^>]+)> (.*)$")
-JOIN_LEAVE_RE = re.compile(r"^\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: (\S+) (joined|left) the game$")
+import mc
+import storage
+import tracker
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",)
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+)
 log = logging.getLogger("rlbot")
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = os.getenv("GUILD_ID")
-
-# Optional: channel to announce shutdowns in. "0" = stay silent.
-MC_ANNOUNCE_CHANNEL_ID = int(os.getenv("MC_ANNOUNCE_CHANNEL_ID", "616023990921723954"))
-
-def load_links() -> dict:
-    try:
-        return json.loads(LINKS_PATH.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def save_links(links: dict) -> None:
-    LINKS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = LINKS_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(links, indent=2))
-    tmp.replace(LINKS_PATH)
-
-
-def parse_pos(resp: str) -> str | None:
-    nums = re.findall(r"(-?\d+\.?\d*)d", resp)
-    if len(nums) != 3:
-        return None
-    x, y, z = (round(float(n)) for n in nums)
-    return f"X: {x}  Y: {y}  Z: {z}"
-
-TRN_API_KEY = os.getenv("TRN_API_KEY", "046ef1ba-317b-4f63-9642-e58570b9a7d0")
-
-TRN_BASE = "https://public-api.tracker.gg/v2/rocket-league/standard/profile"
-
-# This Paper build's threaded region scheduler ("Moonrise") intermittently
-# dispatches RCON commands onto a worker thread instead of the primary one;
-# its own AsyncCatcher then rejects them. Race, not a config/plugin issue —
-# a fresh connection's next attempt is usually fine, so retry past it.
-_ASYNC_CATCHER_MARKER = "Cannot perform command async"
-_RCON_RETRIES = 3
-
-# rcon() signals failure by returning one of these strings instead of
-# raising, so callers that need to distinguish success from failure (e.g.
-# /megaphone, which otherwise always claimed "Sent" even when the server
-# was asleep and nothing actually reached it) must check against this set.
-_RCON_ERROR_STRINGS = frozenset({
-    "RCON timed out — server may be starting or unresponsive.",
-    "RCON auth failed — check MC_RCON_PASSWORD.",
-    "Can't reach RCON — is enable-rcon=true and 25575 published?",
-})
-
-
-async def rcon(cmd: str) -> str:
-    try:
-        for attempt in range(_RCON_RETRIES):
-            async with Client(MC_HOST, MC_RCON_PORT, MC_RCON_PASSWORD) as c:
-                resp, _ = await asyncio.wait_for(c.send_cmd(cmd), timeout=5)
-            if _ASYNC_CATCHER_MARKER not in (resp or ""):
-                return resp or "(no output)"
-            if attempt < _RCON_RETRIES - 1:
-                await asyncio.sleep(0.3)
-        return resp or "(no output)"
-    except asyncio.TimeoutError:
-        return "RCON timed out — server may be starting or unresponsive."
-    except IncorrectPasswordError:
-        return "RCON auth failed — check MC_RCON_PASSWORD."
-    except RCONConnectionError:
-        return "Can't reach RCON — is enable-rcon=true and 25575 published?"
-# Tracker returns a segment per playlist. These are the ones worth showing;
-# add or remove freely.
-PLAYLISTS = [
-    "Ranked Duel 1v1",
-    "Ranked Doubles 2v2",
-    "Ranked Standard 3v3",
-    "Tournament Matches",
-]
+# LAN address until map.mrmake.org's Cloudflare hostname is live, then switch
+# this to "https://map.mrmake.org".
+MC_MAP_BASE_URL = os.getenv("MC_MAP_BASE_URL", "http://192.168.1.183:8100")
+JOIN_MESSAGE_MAX_LEN = 100
 
 PLATFORM_CHOICES = [
     app_commands.Choice(name="Steam", value="steam"),
@@ -135,9 +54,18 @@ PLATFORM_CHOICES = [
     app_commands.Choice(name="Xbox", value="xbl"),
 ]
 
-
-class TrackerError(Exception):
-    """Anything that went wrong talking to Tracker.gg."""
+# value = Minecraft legacy color code (used as `&<code>` in the in-game HUD).
+LOCATION_COLOR_CHOICES = [
+    app_commands.Choice(name="Yellow", value="e"),
+    app_commands.Choice(name="Red", value="c"),
+    app_commands.Choice(name="Green", value="a"),
+    app_commands.Choice(name="Aqua", value="b"),
+    app_commands.Choice(name="Blue", value="9"),
+    app_commands.Choice(name="Purple", value="d"),
+    app_commands.Choice(name="Gold", value="6"),
+    app_commands.Choice(name="White", value="f"),
+]
+DEFAULT_LOCATION_COLOR = "e"
 
 
 class RLBot(discord.Client):
@@ -155,11 +83,15 @@ class RLBot(discord.Client):
     async def setup_hook(self):
         self.session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=15),
-            headers={"TRN-Api-Key": TRN_API_KEY, "Accept": "application/json"},
+            headers={"TRN-Api-Key": tracker.TRN_API_KEY, "Accept": "application/json"},
         )
 
-        if MC_CHAT_CHANNEL_ID:
-            self.loop.create_task(mc_chat_bridge())
+        if mc.MC_CHAT_CHANNEL_ID:
+            self.loop.create_task(mc.mc_chat_bridge())
+
+        # Best-effort — no-ops harmlessly (unknown command) if the server's
+        # asleep or hud.sk isn't deployed yet.
+        self.loop.create_task(push_mccommands())
 
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
@@ -181,7 +113,7 @@ class RLBot(discord.Client):
     async def on_message(self, message: discord.Message):
         if message.author.bot:
             return
-        if not MC_CHAT_CHANNEL_ID or message.channel.id != MC_CHAT_CHANNEL_ID:
+        if not mc.MC_CHAT_CHANNEL_ID or message.channel.id != mc.MC_CHAT_CHANNEL_ID:
             return
 
         # clean_content resolves @mentions/#channels to readable names.
@@ -194,129 +126,11 @@ class RLBot(discord.Client):
 
         who = message.author.display_name
         payload = json.dumps({"text": f"[Discord] {who}: {text}", "color": "aqua"})
-        await rcon(f"tellraw @a {payload}")
+        await mc.rcon(f"tellraw @a {payload}")
 
 
 client = RLBot()
-
-
-async def _bridge_send(text: str) -> None:
-    channel = client.get_channel(MC_CHAT_CHANNEL_ID)
-    if channel is None:
-        try:
-            channel = await client.fetch_channel(MC_CHAT_CHANNEL_ID)
-        except discord.HTTPException as e:
-            log.warning("mc bridge: can't reach channel %s: %s", MC_CHAT_CHANNEL_ID, e)
-            return
-    await channel.send(text)
-
-
-async def mc_chat_bridge():
-    """Tails the Paper log over SSH and mirrors chat (and join/leave) into
-    Discord. `tail -F` follows by filename, so it survives lazymc putting the
-    container to sleep and waking it back up — only an actual SSH drop needs
-    a reconnect."""
-    await client.wait_until_ready()
-    log.info("mc chat bridge starting, channel=%s", MC_CHAT_CHANNEL_ID)
-
-    while not client.is_closed():
-        try:
-            async with asyncssh.connect(
-                MC_SSH_HOST,
-                username=MC_SSH_USER,
-                client_keys=[MC_BRIDGE_SSH_KEY],
-                known_hosts=None,
-                # Without keepalives a dropped connection (NAT/conntrack
-                # timeout, network blip) leaves proc.stdout awaiting data
-                # that will never arrive — no exception, task hangs forever.
-                # These make asyncssh notice and raise so we reconnect.
-                keepalive_interval=30,
-                keepalive_count_max=3,
-            ) as conn:
-                async with conn.create_process(f"tail -F -n0 {MC_CHAT_LOG_PATH}") as proc:
-                    async for line in proc.stdout:
-                        line = line.rstrip("\n")
-
-                        m = CHAT_LINE_RE.match(line)
-                        if m:
-                            name, msg = m.groups()
-                            await _bridge_send(f"**<{name}>** {msg}")
-                            continue
-
-                        if MC_BRIDGE_JOIN_LEAVE:
-                            jm = JOIN_LEAVE_RE.match(line)
-                            if jm:
-                                name, verb = jm.groups()
-                                emoji = "➡️" if verb == "joined" else "⬅️"
-                                await _bridge_send(f"{emoji} *{name} {verb} the game*")
-        except Exception as e:
-            log.warning("mc chat bridge disconnected, retrying in 15s: %s", e)
-
-        await asyncio.sleep(15)
-
-
-async def fetch_profile(platform: str, name: str) -> dict:
-    """Pull a player profile from Tracker.gg."""
-    url = f"{TRN_BASE}/{platform}/{name}"
-    assert client.session is not None
-
-    async with client.session.get(url) as resp:
-        if resp.status == 404:
-            raise TrackerError(
-                f"No tracked profile for **{name}** on {platform}. "
-                "Tracker only knows players who have appeared on the site."
-            )
-        if resp.status == 429:
-            raise TrackerError("Rate limited by Tracker.gg. Try again shortly.")
-        if resp.status in (401, 403):
-            raise TrackerError("Tracker.gg rejected the API key.")
-        if resp.status != 200:
-            raise TrackerError(f"Tracker.gg returned HTTP {resp.status}.")
-
-        return await resp.json()
-
-
-def build_embed(payload: dict, platform: str) -> discord.Embed:
-    data = payload.get("data", {})
-    handle = data.get("platformInfo", {}).get("platformUserHandle", "unknown")
-
-    embed = discord.Embed(
-        title=handle,
-        description=f"Rocket League ranks - {platform}",
-        colour=discord.Colour.from_str("#e57000"),
-    )
-
-    avatar = data.get("platformInfo", {}).get("avatarUrl")
-    if avatar:
-        embed.set_thumbnail(url=avatar)
-
-    found = False
-    for segment in data.get("segments", []):
-        label = segment.get("metadata", {}).get("name")
-        if label not in PLAYLISTS:
-            continue
-
-        stats = segment.get("stats", {})
-        tier = stats.get("tier", {}).get("metadata", {}).get("name", "Unranked")
-        division = stats.get("division", {}).get("metadata", {}).get("name", "")
-        mmr = stats.get("rating", {}).get("value")
-
-        line = tier if not division else f"{tier} {division}"
-        if mmr is not None:
-            line += f"\n{int(mmr)} MMR"
-
-        embed.add_field(name=label, value=line, inline=True)
-        found = True
-
-    if not found:
-        embed.add_field(
-            name="No ranked data",
-            value="This profile has no tracked competitive playlists.",
-            inline=False,
-        )
-
-    embed.set_footer(text="Data via Tracker.gg")
-    return embed
+mc.init(client)
 
 
 @client.tree.command(name="rlstats", description="Look up Rocket League ranks")
@@ -335,8 +149,8 @@ async def rlstats(
     await interaction.response.defer()
 
     try:
-        payload = await fetch_profile(platform.value, player)
-    except TrackerError as exc:
+        payload = await tracker.fetch_profile(client.session, platform.value, player)
+    except tracker.TrackerError as exc:
         await interaction.followup.send(str(exc), ephemeral=True)
         return
     except asyncio.TimeoutError:
@@ -347,24 +161,25 @@ async def rlstats(
         await interaction.followup.send("Something broke. Check the logs.", ephemeral=True)
         return
 
-    await interaction.followup.send(embed=build_embed(payload, platform.name))
+    await interaction.followup.send(embed=tracker.build_embed(payload, platform.name))
+
 
 @client.tree.command(name="link", description="link your Minecraft username")
 @app_commands.describe(username="Your Minecraft username")
 async def link_cmd(interaction: discord.Interaction, username: str):
-    links = load_links()
+    links = storage.load_links()
     links[str(interaction.user.id)] = username
-    save_links(links)
+    storage.save_links(links)
     await interaction.response.send_message(f"Linked to `{username}`", ephemeral=True)
 
 
 @client.tree.command(name="unlink", description="remove your Minecraft link")
 async def unlink_cmd(interaction: discord.Interaction):
-    links = load_links()
+    links = storage.load_links()
     if links.pop(str(interaction.user.id), None) is None:
         await interaction.response.send_message("You aren't linked.", ephemeral=True)
         return
-    save_links(links)
+    storage.save_links(links)
     await interaction.response.send_message("Unlinked.", ephemeral=True)
 
 
@@ -374,35 +189,320 @@ async def unlink_cmd(interaction: discord.Interaction):
 async def say_cmd(interaction: discord.Interaction, message: str):
     await interaction.response.defer()
     who = interaction.user.display_name
-    resp = await rcon(f"say [{who}] {message}")
-    if resp in _RCON_ERROR_STRINGS:
+    resp = await mc.rcon(f"say [{who}] {message}")
+    if resp in mc._RCON_ERROR_STRINGS:
         await interaction.followup.send(resp)
         return
     await interaction.followup.send(f"Sent: `[{who}] {message}`")
 
-@client.tree.command(name="where", description="get live player coordinates")
-@app_commands.describe(username="Minecraft username (optional if linked)")
-async def where_cmd(interaction: discord.Interaction, username: str | None = None):
+
+@client.tree.command(name="find", description="Find a player's live position, or one of their saved locations")
+@app_commands.describe(
+    user="Whose position/location — @ mention a linked Discord member (optional, defaults to you)",
+    username="Or a Minecraft username directly, if they're not on Discord",
+    location="A saved location name — omit for their live position instead",
+)
+async def find_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+    username: str | None = None,
+    location: str | None = None,
+):
     await interaction.response.defer()
 
-    if username is None:
-        username = load_links().get(str(interaction.user.id))
-        if username is None:
-            await interaction.followup.send("Not linked — run `/link <username>` first.")
+    discord_id: str | None = None
+    if user is not None:
+        mc_username = storage.load_links().get(str(user.id))
+        if mc_username is None:
+            await interaction.followup.send(f"{user.mention} isn't linked — they need to run `/link <username>`.")
             return
+        discord_id = str(user.id)
+    elif username is not None:
+        mc_username = username
+    else:
+        mc_username = storage.load_links().get(str(interaction.user.id))
+        if mc_username is None:
+            await interaction.followup.send("Not linked — run `/link <username>` first, or give a username.")
+            return
+        discord_id = str(interaction.user.id)
 
-    resp = await rcon(f"data get entity {username} Pos")
-    pos = parse_pos(resp)
+    if location:
+        key = location.strip().lower()
+        locations = storage.load_locations()
+        if discord_id is not None:
+            entry = locations.get(discord_id, {}).get(key)
+        else:
+            entry = next(
+                (
+                    locs[key] for locs in locations.values()
+                    if key in locs and locs[key]["mc_username"].lower() == mc_username.lower()
+                ),
+                None,
+            )
+        if entry is None:
+            await interaction.followup.send(f"No saved `{location}` for `{mc_username}`.")
+            return
+        await interaction.followup.send(
+            f"📍 **{entry['display_name']}** ({entry['mc_username']})\n"
+            f"X: {entry['x']}  Y: {entry['y']}  Z: {entry['z']}"
+        )
+        return
+
+    resp = await mc.rcon(f"data get entity {mc_username} Pos")
+    pos = mc.parse_pos(resp)
     if pos is None:
+        await interaction.followup.send(f"Couldn't find `{mc_username}` — online and spelled right?")
+        return
+    await interaction.followup.send(f"**{mc_username}**\n{pos}")
+
+
+@client.tree.command(name="setlocation", description="Save your current in-game position as a named location")
+@app_commands.describe(
+    name="A short name for this spot (e.g. house, mine, base)",
+    color="HUD marker color in-game (default yellow)",
+)
+@app_commands.choices(color=LOCATION_COLOR_CHOICES)
+async def setlocation_cmd(
+    interaction: discord.Interaction,
+    name: str,
+    color: app_commands.Choice[str] | None = None,
+):
+    await interaction.response.defer()
+
+    username = storage.load_links().get(str(interaction.user.id))
+    if username is None:
+        await interaction.followup.send("Not linked — run `/link <username>` first.")
+        return
+
+    resp = await mc.rcon(f"data get entity {username} Pos")
+    xyz = mc.parse_pos_xyz(resp)
+    if xyz is None:
         await interaction.followup.send(f"Couldn't find `{username}` — online and spelled right?")
         return
-    await interaction.followup.send(f"**{username}**\n{pos}")
+
+    x, y, z = xyz
+    color_code = color.value if color else DEFAULT_LOCATION_COLOR
+    key = name.strip().lower()
+
+    locations = storage.load_locations()
+    user_locs = locations.setdefault(str(interaction.user.id), {})
+    user_locs[key] = {
+        "display_name": name.strip(),
+        "mc_username": username,
+        "x": x, "y": y, "z": z,
+        "color": color_code,
+    }
+    storage.save_locations(locations)
+
+    # Push it into the in-game HUD too — see locations.sk on the MC server,
+    # which drives the sidebar off this variable store. In-game /setlocation
+    # pushes back the other way (LOCSYNC over the chat bridge, see mc.py) so
+    # the two stay in sync regardless of which side you save from.
+    push_resp = await mc.rcon(
+        f"setlocationmc {username} {key} {x} {y} {z} {mc.MC_WORLD_NAME} {color_code}"
+    )
+    hud_note = "" if push_resp not in mc._RCON_ERROR_STRINGS else "\n⚠️ HUD marker didn't sync — server may be asleep."
+
+    await interaction.followup.send(
+        f"📍 Saved **{name.strip()}** at X: {x}  Y: {y}  Z: {z}{hud_note}"
+    )
+
+
+@client.tree.command(name="removelocation", description="Remove one of your saved locations")
+@app_commands.describe(name="The location's name to remove")
+async def removelocation_cmd(interaction: discord.Interaction, name: str):
+    await interaction.response.defer()
+
+    username = storage.load_links().get(str(interaction.user.id))
+    if username is None:
+        await interaction.followup.send("Not linked — run `/link <username>` first.")
+        return
+
+    key = name.strip().lower()
+    locations = storage.load_locations()
+    user_locs = locations.get(str(interaction.user.id), {})
+    if key not in user_locs:
+        await interaction.followup.send(f"You don't have a location named `{name}`.")
+        return
+
+    del user_locs[key]
+    storage.save_locations(locations)
+
+    push_resp = await mc.rcon(f"removelocationmc {username} {key}")
+    hud_note = "" if push_resp not in mc._RCON_ERROR_STRINGS else "\n⚠️ HUD marker removal didn't sync — server may be asleep."
+
+    await interaction.followup.send(f"🗑️ Removed **{name.strip()}**{hud_note}")
+
+
+@client.tree.command(name="locations", description="List saved location names")
+@app_commands.describe(
+    user="Whose locations — @ mention a linked Discord member (optional, defaults to you)",
+    username="Or a Minecraft username directly, if they're not on Discord",
+)
+async def locations_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+    username: str | None = None,
+):
+    await interaction.response.defer()
+
+    locations = storage.load_locations()
+
+    if user is not None:
+        user_locs = locations.get(str(user.id), {})
+        if not user_locs:
+            await interaction.followup.send(f"{user.mention} hasn't saved any locations.")
+            return
+    elif username is not None:
+        user_locs = next(
+            (
+                locs for locs in locations.values()
+                if any(v["mc_username"].lower() == username.lower() for v in locs.values())
+            ),
+            {},
+        )
+        if not user_locs:
+            await interaction.followup.send(f"No saved locations for `{username}`.")
+            return
+    else:
+        user_locs = locations.get(str(interaction.user.id), {})
+        if not user_locs:
+            await interaction.followup.send("You haven't saved any locations — try `/setlocation <name>`.")
+            return
+
+    lines = [f"• **{v['display_name']}** — X: {v['x']}  Y: {v['y']}  Z: {v['z']}" for v in user_locs.values()]
+    await interaction.followup.send("\n".join(lines))
+
+
+@client.tree.command(name="joinmessage", description="Set the message broadcast in-game when you join the Minecraft server")
+@app_commands.describe(message=f"Your custom join message (max {JOIN_MESSAGE_MAX_LEN} chars)")
+async def joinmessage_cmd(interaction: discord.Interaction, message: str):
+    await interaction.response.defer(ephemeral=True)
+
+    username = storage.load_links().get(str(interaction.user.id))
+    if username is None:
+        await interaction.followup.send("Not linked — run `/link <username>` first.", ephemeral=True)
+        return
+
+    text = " ".join(message.split())  # collapse newlines/whitespace so it stays a single RCON line
+    if not text:
+        await interaction.followup.send("Message can't be empty.", ephemeral=True)
+        return
+    if len(text) > JOIN_MESSAGE_MAX_LEN:
+        await interaction.followup.send(
+            f"Message is too long ({len(text)}/{JOIN_MESSAGE_MAX_LEN} chars).", ephemeral=True
+        )
+        return
+
+    messages = storage.load_joinmessages()
+    messages[str(interaction.user.id)] = {"mc_username": username, "message": text}
+    storage.save_joinmessages(messages)
+
+    push_resp = await mc.rcon(f"setjoinmessagemc {username} {text}")
+    hud_note = "" if push_resp not in mc._RCON_ERROR_STRINGS else "\n⚠️ Didn't sync to the server — it may be asleep. Run this again once it's up."
+
+    await interaction.followup.send(f"✅ Join message set to: {text}{hud_note}", ephemeral=True)
+
+
+@client.tree.command(name="removejoinmessage", description="Reset your Minecraft join message to the default")
+async def removejoinmessage_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    username = storage.load_links().get(str(interaction.user.id))
+    if username is None:
+        await interaction.followup.send("Not linked — run `/link <username>` first.", ephemeral=True)
+        return
+
+    messages = storage.load_joinmessages()
+    if messages.pop(str(interaction.user.id), None) is None:
+        await interaction.followup.send("You don't have a custom join message set.", ephemeral=True)
+        return
+    storage.save_joinmessages(messages)
+
+    push_resp = await mc.rcon(f"removejoinmessagemc {username}")
+    hud_note = "" if push_resp not in mc._RCON_ERROR_STRINGS else "\n⚠️ Didn't sync to the server — it may be asleep. Run this again once it's up."
+
+    await interaction.followup.send(f"🗑️ Join message reset to default.{hud_note}", ephemeral=True)
+
+
+@client.tree.command(name="map", description="Get a link to the live map centered on a spot")
+@app_commands.describe(
+    x="X coordinate (skip this and z to use a player/location instead)",
+    z="Z coordinate",
+    user="Whose position — @ mention a linked Discord member (optional, defaults to you)",
+    username="Or a Minecraft username directly",
+    location="A saved location name instead of a live position",
+)
+async def map_cmd(
+    interaction: discord.Interaction,
+    x: int | None = None,
+    z: int | None = None,
+    user: discord.Member | None = None,
+    username: str | None = None,
+    location: str | None = None,
+):
+    await interaction.response.defer()
+
+    if x is not None and z is not None:
+        await interaction.followup.send(f"🗺️ {MC_MAP_BASE_URL}/#overworld:{x}:64:{z}:400:0:0:0:0:perspective")
+        return
+
+    discord_id: str | None = None
+    mc_username: str | None = None
+    if user is not None:
+        mc_username = storage.load_links().get(str(user.id))
+        if mc_username is None:
+            await interaction.followup.send(f"{user.mention} isn't linked — they need to run `/link <username>`.")
+            return
+        discord_id = str(user.id)
+    elif username is not None:
+        mc_username = username
+    elif location is None:
+        mc_username = storage.load_links().get(str(interaction.user.id))
+        if mc_username is None:
+            await interaction.followup.send("Not linked — run `/link <username>` first, give a username, or give x/z.")
+            return
+        discord_id = str(interaction.user.id)
+
+    if location:
+        key = location.strip().lower()
+        locations = storage.load_locations()
+        if discord_id is not None:
+            entry = locations.get(discord_id, {}).get(key)
+        elif mc_username is not None:
+            entry = next(
+                (
+                    locs[key] for locs in locations.values()
+                    if key in locs and locs[key]["mc_username"].lower() == mc_username.lower()
+                ),
+                None,
+            )
+        else:
+            entry = locations.get(str(interaction.user.id), {}).get(key)
+        if entry is None:
+            await interaction.followup.send(f"No saved `{location}` found.")
+            return
+        await interaction.followup.send(
+            f"🗺️ **{entry['display_name']}**\n"
+            f"{MC_MAP_BASE_URL}/#overworld:{entry['x']}:64:{entry['z']}:400:0:0:0:0:perspective"
+        )
+        return
+
+    resp = await mc.rcon(f"data get entity {mc_username} Pos")
+    xyz = mc.parse_pos_xyz(resp)
+    if xyz is None:
+        await interaction.followup.send(f"Couldn't find `{mc_username}` — online and spelled right?")
+        return
+    px, _, pz = xyz
+    await interaction.followup.send(f"🗺️ **{mc_username}**\n{MC_MAP_BASE_URL}/#overworld:{px}:64:{pz}:400:0:0:0:0:perspective")
+
 
 @client.tree.command(name="tps", description="Minecraft server tick times")
 async def tps_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
-    resp = await rcon("mspt")
+    resp = await mc.rcon("mspt")
     await interaction.followup.send(f"```{resp}```")
+
 
 @client.tree.command(name="clear", description="Delete this bot's recent messages in this channel")
 @app_commands.describe(amount="How many recent messages to scan for bot messages to delete (default 20, max 100)")
@@ -433,206 +533,53 @@ async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(f"Up. {latency} ms to Discord.")
 
 
-
-_LIST_RE = re.compile(r"There are (\d+) of a max of \d+ players online:?\s*(.*)")
-
-
-async def _mc_status():
-    """RCON reachability check. Returns the raw `list` command output if the
-    server is awake, or None if it's asleep/unreachable. Never trust port
-    25565 here — lazymc answers pings itself even while the container is
-    stopped, so a ping always looks "up"."""
-    try:
-        for attempt in range(_RCON_RETRIES):
-            async with Client(MC_HOST, MC_RCON_PORT, MC_RCON_PASSWORD) as c:
-                resp, _ = await asyncio.wait_for(c.send_cmd("list"), timeout=5)
-            if _ASYNC_CATCHER_MARKER not in (resp or ""):
-                return resp
-            if attempt < _RCON_RETRIES - 1:
-                await asyncio.sleep(0.3)
-        return resp
-    except (RCONConnectionError, asyncio.TimeoutError, IncorrectPasswordError):
-        return None
-
-
-def _parse_list(resp: str) -> tuple[int, list[str]]:
-    m = _LIST_RE.search(resp or "")
-    if not m:
-        return 0, []
-    online = int(m.group(1))
-    names = [n.strip() for n in m.group(2).split(",") if n.strip()]
-    return online, names
-
-
-async def stop_minecraft_container(reason: str) -> str:
-    """save-all over RCON, then `docker stop` over SSH. Returns a status message."""
-    # Best-effort world save first — don't abort the stop if this fails,
-    # since `docker stop` sends SIGTERM and the Paper server saves on shutdown
-    # anyway (your stop_grace_period: 120s gives it room to finish).
-    try:
-        async with Client(MC_HOST, MC_RCON_PORT, MC_RCON_PASSWORD) as c:
-            await c.send_cmd("save-all")
-    except Exception as e:
-        print(f"[mc-shutdown] save-all failed, continuing: {e}")
- 
-    try:
-        async with asyncssh.connect(
-            MC_SSH_HOST,
-            username=MC_SSH_USER,
-            client_keys=[MC_SSH_KEY],
-            known_hosts=None,
-        ) as conn:
-            result = await conn.run(f"docker stop {MC_CONTAINER}", check=False)
- 
-        if result.exit_status == 0:
-            msg = f"🛑 Minecraft server stopped ({reason})."
-        else:
-            err = (result.stderr or "").strip() or f"exit {result.exit_status}"
-            msg = f"⚠️ `docker stop` failed: {err}"
-    except Exception as e:
-        msg = f"⚠️ Couldn't reach the Minecraft host over SSH: {e}"
- 
-    print(f"[mc-shutdown] {msg}")
- 
-    if MC_ANNOUNCE_CHANNEL_ID:
-        channel = client.get_channel(MC_ANNOUNCE_CHANNEL_ID)
-        if channel:
-            await channel.send(msg)
- 
-    return msg
- 
- 
-async def start_minecraft_container(reason: str) -> str:
-    """Starts the container via the forced-command wake key."""
-    try:
-        async with asyncssh.connect(
-            MC_SSH_HOST,
-            username=MC_SSH_USER,
-            client_keys=[MC_WAKE_KEY],
-            known_hosts=None,
-        ) as conn:
-            # Argument is ignored — authorized_keys forces `docker start minecraft`
-            result = await conn.run("start", check=False)
-
-        if result.exit_status == 0:
-            msg = (
-                f"▶️ Minecraft server starting ({reason}) — "
-                "give it 30-60s before connecting."
-            )
-        else:
-            err = (result.stderr or "").strip() or f"exit {result.exit_status}"
-            msg = f"⚠️ Start failed: {err}"
-    except Exception as e:
-        msg = f"⚠️ Couldn't reach the Minecraft host over SSH: {e}"
-
-    print(f"[mc-start] {msg}")
-    return msg
-
-
-# --- /start command --------------------------------------------------------
 @client.tree.command(name="start", description="Start the Minecraft server")
 async def start_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    if await _mc_status() is not None:
+    if await mc.mc_status() is not None:
         await interaction.followup.send("Server is already up.")
         return
 
-    result = await start_minecraft_container(f"manual, by {interaction.user.display_name}")
+    result = await mc.start_minecraft_container(f"manual, by {interaction.user.display_name}")
     await interaction.followup.send(result)
 
 
-# --- button for /mcstatus ---------------------------------------------------
-class _StartButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(label="Start server", style=discord.ButtonStyle.success, emoji="▶️")
-
-    async def callback(self, interaction: discord.Interaction):
-        self.disabled = True
-        await interaction.response.edit_message(view=self.view)
-        msg = await start_minecraft_container(f"button, by {interaction.user.display_name}")
-        await interaction.followup.send(msg)
-
-
-class _StartView(discord.ui.View):
-    """Only one of these should ever be live at a time — see
-    _last_start_view below. Disables its own button once idle for 5
-    minutes so a dead button doesn't sit in the channel forever."""
-
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.message: discord.Message | None = None
-        self.add_item(_StartButton())
-
-    async def on_timeout(self):
-        for item in self.children:
-            item.disabled = True
-        if self.message is not None:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-
-# Most recent live "Start server" button, if any. Cleared (button disabled)
-# as soon as a newer /mcstatus asleep-response replaces it, so only ever one
-# start button is live in the channel at a time instead of piling up.
-_last_start_view: _StartView | None = None
-
-
-async def _retire_last_start_view() -> None:
-    global _last_start_view
-    view = _last_start_view
-    _last_start_view = None
-    if view is None:
-        return
-    view.stop()
-    for item in view.children:
-        item.disabled = True
-    if view.message is not None:
-        try:
-            await view.message.edit(view=view)
-        except discord.HTTPException:
-            pass
-
-
-# --- /mcstatus command -------------------------------------------------
 @client.tree.command(name="mcstatus", description="Minecraft server status")
 async def mcstatus_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    resp = await _mc_status()
+    resp = await mc.mc_status()
     if resp is None:
-        global _last_start_view
-        await _retire_last_start_view()
+        await mc.retire_last_start_view()
 
-        view = _StartView()
+        view = mc.StartView()
         msg = await interaction.followup.send(
             "Server is asleep — nobody's connected. lazymc will spin it up "
             "when someone joins, or use the button below.",
             view=view,
         )
         view.message = msg
-        _last_start_view = view
+        mc.set_last_start_view(view)
         return
 
-    online, names = _parse_list(resp)
+    online, names = mc.parse_list(resp)
     names_text = ", ".join(names) if names else "nobody"
     text = f"**Online:** {online}\n**Players:** {names_text}"
     await interaction.followup.send(text)
 
-# --- /shutdown command -----------------------------------------------------
+
 @client.tree.command(name="shutdown", description="Stop the Minecraft server")
 async def shutdown_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    resp = await _mc_status()
+    resp = await mc.mc_status()
 
     if resp is None:
         await interaction.followup.send("Server already appears to be offline.")
         return
 
-    online, _ = _parse_list(resp)
+    online, _ = mc.parse_list(resp)
     if online > 0:
         await interaction.followup.send(
             f"⚠️ {online} player(s) still online — not stopping. "
@@ -640,8 +587,77 @@ async def shutdown_cmd(interaction: discord.Interaction):
         )
         return
 
-    result = await stop_minecraft_container(f"manual, by {interaction.user.display_name}")
+    result = await mc.stop_minecraft_container(f"manual, by {interaction.user.display_name}")
     await interaction.followup.send(result)
+
+
+# --- /commands, /mccommands -------------------------------------------------
+# Static reference, not introspected — Discord slash commands and Minecraft
+# in-game/console commands live in entirely separate systems (discord.py's
+# command tree vs Bukkit's command map inside the Skript/Essentials plugins),
+# so there's no single source to query both from. Keep this in sync by hand
+# when commands are added/removed/permission changes on either side. The
+# Minecraft section is pushed to the server at startup (see push_mccommands
+# below) rather than hand-copied, so /mccommands in-game always matches this.
+_DISCORD_COMMANDS = """**Discord**
+`/rlstats <platform> <player>` — everyone
+`/link <username>` / `/unlink` — everyone
+`/find [player] [name]` — everyone
+`/setlocation <name> [color]` / `/removelocation <name>` — everyone, requires `/link` first
+`/locations [player]` — everyone
+`/joinmessage <text>` / `/removejoinmessage` — everyone, requires `/link` first
+`/map [player] [x] [z]` — everyone
+`/mcstatus` / `/tps` / `/ping` — everyone
+`/start` / `/shutdown` — everyone
+`/megaphone <message>` — requires the **Minecraft** Discord role
+`/clear [amount]` — requires **Manage Messages** permission
+`/commands` / `/mccommands` — everyone"""
+
+_MINECRAFT_COMMANDS = """**Minecraft (in-game chat)**
+`/setlocation <name> [color]` / `/removelocation <name>` — everyone
+`/pin <name> [permanent]` / `/unpin <name>` — everyone
+`/track <player> [permanent]` / `/untrack <player>` — everyone
+`/sethome` (Essentials) — everyone, also pins "home" on the HUD automatically
+`/find [player] [name]` / `/locations [player]` — everyone
+`/shophelp` / `/mccommands` — everyone
+`/balance` (`/bal`) / `/balancetop` / `/pay <player> <amount>` — everyone
+Shop signs (ChestShop) — everyone, no command — right-click trades, and also shows a breakdown of owner/price/item
+Sneak + right-click glass — cycles its color, then tinted glass, then back to plain (no command)
+`/eco give\\|take\\|set <player> <amount>` — op only
+`/op` / `/deop` / `/lp ...` (LuckPerms) — op / console only
+WorldEdit (`//wand`, `//set`, etc.) — op / builder only, not itemized here"""
+
+_COMMAND_REFERENCE = f"""
+{_DISCORD_COMMANDS}
+
+{_MINECRAFT_COMMANDS}
+
+Some Discord commands quietly bridge to Minecraft over RCON as a separate \
+console-only command (e.g. `/joinmessage` → `setjoinmessagemc`) — those \
+bridge commands aren't directly runnable by anyone and are left off this list.
+"""
+
+
+@client.tree.command(name="commands", description="List available commands and where each one works")
+async def commands_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message(_COMMAND_REFERENCE, ephemeral=True)
+
+
+@client.tree.command(name="mccommands", description="List only the Minecraft in-game commands")
+async def mccommands_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message(_MINECRAFT_COMMANDS, ephemeral=True)
+
+
+async def push_mccommands() -> None:
+    """Pushes _MINECRAFT_COMMANDS to the server as a stored Skript variable,
+    so in-game /mccommands (hud.sk) always matches this file instead of a
+    hand-copied duplicate. One RCON line per line of text — setmccommandsmc
+    (console-only) appends rather than replacing, so it's cleared first."""
+    lines = _MINECRAFT_COMMANDS.replace("\\|", "|").split("\n")
+    await mc.rcon("clearmccommandsmc")
+    for line in lines:
+        await mc.rcon(f"setmccommandsmc {line}")
+
 
 if __name__ == "__main__":
     client.run(TOKEN, log_handler=None)

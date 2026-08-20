@@ -2,10 +2,27 @@
 
 Discord bot, Python + discord.py, runs in Docker in Proxmox CT 100
 ("jack-dreams", 192.168.1.235). Rebuild after ANY code change:
-`docker compose up -d --build` — editing bot.py alone does nothing.
+`docker compose up -d --build` — editing bot.py alone does nothing
+(applies to any of the split-out modules below, not just bot.py).
 
-Commands: rlstats, link, unlink, mcstatus, megaphone, where, tps,
-ping, shutdown.
+As of 2026-08-19, split across four files instead of one:
+- `bot.py` — RLBot class + every `/command` handler, `_COMMAND_REFERENCE`.
+- `storage.py` — generic `load_json`/`save_json` + typed wrappers for
+  links/locations/joinmessages (was three hand-duplicated pairs).
+- `mc.py` — RCON, container start/stop/status, the chat bridge (incl.
+  location sync, see below), `_StartView`/button.
+- `tracker.py` — Tracker.gg lookups for /rlstats.
+
+Commands: rlstats, link, unlink, mcstatus, megaphone, find, setlocation,
+removelocation, locations, joinmessage, removejoinmessage, map, tps, ping,
+shutdown, commands, mccommands.
+
+Location sync is bidirectional: Discord's /setlocation already pushed to
+{loc.*} over RCON; in-game /setlocation (locations.sk) now also prints a
+`LOCSYNC:<player>:<name>:<x>:<y>:<z>:<color>` line to console, which
+mc.py's chat-bridge log-tail parses (LOCSYNC_RE/LOCREMOVE_RE) and applies
+to locations.json via `_sync_location_from_game`. A location saved from
+either side now reaches the other — previously only Discord→game worked.
 
 ## Minecraft server (separate box, CT 101)
 192.168.1.183, /root/minecraft-server. Paper 26.2, max 20 players.
@@ -43,21 +60,118 @@ minimum_online_time=120, start_timeout=300.
   resolving; when that resolver is unreachable, the itzg image's
   entrypoint can't verify the Paper build against fill.papermc.io
   and the container fails to boot entirely (VERSION=LATEST triggers
-  this check on every start, not just first install). Currently
-  pointed at 192.168.1.99 (primary) / 192.168.1.235 (backup) in
+  this check on every start, not just first install). This looks
+  like the server being permanently "asleep" — lazymc tries to wake
+  it, the minecraft container dies on the DNS check, lazymc force-
+  stops it and goes back to sleep, repeat forever. Check `docker
+  logs minecraft` for `UnknownHostException: Failed to resolve
+  'fill.papermc.io'` to confirm.
+  Pointed at 192.168.1.99 (primary) / 192.168.1.235 (backup) in
   /etc/resolv.conf on CT 101 after the router's resolver hung.
+  Recurred on 2026-08-17: a DHCP lease renewal overwrote
+  /etc/resolv.conf with the router's (broken) nameserver again,
+  since resolv.conf alone doesn't survive renewal. Fixed durably
+  by adding `supersede domain-name-servers 192.168.1.99,
+  192.168.1.235;` to /etc/dhcp/dhclient.conf on CT 101 so renewals
+  can't clobber it again. If the server is asleep and won't wake,
+  check /etc/resolv.conf on CT 101 and re-apply if it's drifted
+  back to 192.168.1.1.
 - /root/minecraft-server/data/usercache.json is the authoritative
   source for exact player name spelling/casing — several requested
   usernames (FrazzleDrip, BeeKeeper42, 1mantaskforce, Chortlemyballs)
   didn't match the real account and had to be corrected against it.
+- joinmessage.sk's "on join" trigger used bare %player% as a variable
+  index ({joinmsg::%player%}), but Skript's global config has "use
+  player UUIDs in variable names: true", which silently rewrites any
+  %player% interpolated into a variable index into the player's UUID.
+  /setjoinmessagemc writes with {joinmsg::%arg-1%}, where arg-1 is a
+  plain name string — so the read (UUID-keyed) and write (name-keyed)
+  never hit the same variable. Net effect: join messages set via
+  /joinmessage silently never displayed for anyone, since server
+  install. Fixed 2026-08-18 by changing the "on join" lookup to
+  {joinmsg::%name of player%}, which forces the string-name form and
+  matches the write side. If a similar "set X via command, read X on
+  an event" pattern shows up elsewhere keyed off a player variable,
+  check for this same mismatch — it fails completely silently, no
+  error anywhere, the value just never matches on read.
+- variables.csv is NOT a live view of Skript's variable state — it's
+  written at startup/shutdown, not continuously despite what Skript's
+  own config comments imply. Don't grep it to check whether a SET
+  just took effect; the change is live in memory immediately, the
+  file just hasn't caught up. Only trust the file to check state as
+  of last boot.
 
 ## Plugins (CT 101)
 - BlockLogger, bStats, spark — pre-existing, not managed here.
-- Skript 2.16.1 (plugins/Skript.jar) — installed for simple
-  event-driven scripting without a custom compiled plugin. Scripts
-  live in plugins/Skript/scripts/*.sk.
-- plugins/Skript/scripts/king.sk — per-player join broadcasts (an
-  "on join: if player's name is X: broadcast Y" rule per player).
-  Edit via scp + `chown 1000:1000`, then either wait for the next
-  natural boot or run `sk reload all` over RCON if the server's
-  already awake — no container restart needed for script changes.
+- Vault, EssentialsX, LuckPerms, ChestShop, WorldEdit — economy/shop/
+  permissions stack, added 2026-08-18. LuckPerms is required for any
+  non-op Essentials permission (e.g. essentials.balance) to work at
+  all — without a permissions plugin, Bukkit's SuperPerms fallback
+  only grants op-only or explicitly-`default: true` nodes.
+- PlaceholderAPI + TAB (NEZNAMY) + skhud-bridge — added 2026-08-19 for
+  the in-game HUD sidebar/tab-footer. **Do not install SkBee** — it
+  crashes on enable on this server's Paper version (26.2); no SkBee
+  release, past or present, has ever targeted a version this new, so
+  trying a different SkBee version won't help either. Base Skript
+  also has zero built-in sidebar/tab-footer syntax (confirmed by
+  testing to failure with SkBee fully removed) — there is no
+  addon-free path. skhud-bridge (source at /root/skhud-bridge on the
+  bot host, Maven project, JDK 25) is a deliberately thin custom
+  plugin: it does NOT touch Scoreboard/Player-list APIs at all, only
+  implements a PlaceholderAPI expansion (%skhud_<key>%) backed by an
+  in-memory per-player map, updated via its own `skhudset`/
+  `skhudclear` console commands. TAB (confirmed compatible with
+  26.2, actively maintained) does all the actual per-player
+  rendering — its `scoreboard`/`header-footer` sections in
+  `/data/plugins/TAB/config.yml` are templated with `%skhud_line_N%`
+  / `%skhud_title%` (sidebar) and `%skhud_footer_N%` (tab-press full
+  coordinates), config also mirrored at data/tab-config.yml in this
+  repo. Rebuild skhud-bridge: `cd /root/skhud-bridge && mvn package`,
+  deploy the resulting target/skhud-bridge.jar, restart (new/changed
+  Java always needs a restart, unlike .sk files).
+- Skript 2.16.1 (plugins/Skript.jar) — event-driven scripting without
+  a custom compiled plugin for most features. Scripts live in
+  plugins/Skript/scripts/*.sk, source-of-truth copies in this repo's
+  data/. Edit via scp + `chown 1000:1000` (uid/gid 1000, not root —
+  see gotcha above), then `sk reload <file>.sk` over RCON if the
+  server's already awake — no restart needed for .sk changes, only
+  for new/changed plugin jars.
+  - **`run console command` is not valid Skript syntax** — the real
+    effect is `execute console command`. Using the wrong one produces
+    a wall of "Can't understand this condition/effect" parse errors
+    long enough to exceed RCON's response size and make `rcon-cli`
+    fail with "response too long" instead of showing them; use a
+    direct RCON client (e.g. this repo's data/tools/rcon_client.py)
+    to see the real error text in that situation.
+  - clock.sk — the *only* `every 1 second: loop all players` trigger
+    on the server; calls `tickHud(loop-player)` (hud.sk) and
+    `tickRaceFall(loop-player)` (race.sk) so per-player per-second
+    work happens in one shared loop instead of each script running
+    its own (locationhud.sk and race.sk used to, independently).
+  - locations.sk — /setlocation, /removelocation, /find, /locations,
+    plus /setlocationmc, /removelocationmc (console-only, RCON-pushed
+    from bot.py). Also prints LOCSYNC/LOCREMOVE to console (see the
+    bot.py section above for the bidirectional sync this feeds).
+  - hud.sk — /pin, /unpin, /track, /untrack, an `on command` hook
+    that auto-pins "home" (permanent) whenever Essentials' /sethome
+    runs, and `tickHud()` which builds each player's sidebar/footer
+    content and pushes it via `skhudset`. Multiple pins and/or
+    tracked players can be active at once, each shown as
+    "<name> <compass dir> <distance>"; an entry auto-removes once
+    you're within 5 blocks unless added with the "permanent" keyword
+    (`/pin home permanent`, `/track Steve permanent`). Full exact
+    coordinates for every active pin/tracked-player show on
+    tab-press (TAB's header/footer), not in the compact sidebar.
+  - race.sk, tint.sk, shopsigninfo.sk, mccommands.sk — unchanged in
+    structure; race.sk's fall-death check was extracted from its own
+    "every 1 second" into `tickRaceFall()`, called from clock.sk.
+  - joinmessage.sk (source of truth: data/joinmessage.sk in this
+    repo) — custom per-player join messages, set via Discord's
+    /joinmessage and pushed in over RCON. Replaces the vanilla join
+    line with the player's text via a single "on join" trigger keyed
+    off the {joinmsg::*} variable store, so a player only ever gets
+    one join message. Formerly king.sk hardcoded 8 players' messages
+    as a second, separate on-join trigger (always firing alongside
+    the vanilla line); that file was deleted 2026-08-18 and its
+    entries migrated into {joinmsg::*} so there's exactly one
+    mechanism now.
