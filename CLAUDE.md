@@ -215,6 +215,21 @@ minimum_online_time=120, start_timeout=300.
     commands (and have the bot translate its Discord markdown to
     legacy color codes on the way in) or delete `push_mccommands`;
     until then treat the two lists as a manual sync point.
+  - **The ChestShop sign format now lives in three places** and is
+    hand-synced: `_SHOP_SIGN` in bot.py (Discord `/commands` and
+    `/mccommands`), mccommands.sk (in-game `/mccommands`) and
+    shophelp.sk (in-game `/shophelp`, the long form). Its specifics are
+    read off `plugins/ChestShop/config.yml` and go stale if that
+    changes — currently `REVERSE_BUTTONS: false` (right-click buys,
+    **left**-click sells), `ALLOW_AUTO_ITEM_FILL: true` (line 4 takes
+    `?`, not a blank line), `BLOCK_SHOPS_WITH_SELL_PRICE_HIGHER_THAN_BUY_PRICE:
+    true` (S ≤ B), `SHOP_CREATION_PRICE: 0`, `USE_BUILT_IN_PROTECTION:
+    true`, `SHOP_CONTAINERS` limited to CHEST/TRAPPED_CHEST.
+  - Discord's `/commands` and `/mccommands` send **embeds**, not plain
+    messages: the full reference renders to ~2400 characters, past the
+    2000-character cap on message content, which would make the command
+    fail to send outright. Embed descriptions allow 4096 — check the
+    rendered length before adding to those lists.
   - race.sk, tint.sk, shopsigninfo.sk — unchanged in
     structure; race.sk's fall-death check was extracted from its own
     "every 1 second" into `tickRaceFall()`, called from clock.sk.

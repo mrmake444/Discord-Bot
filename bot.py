@@ -621,16 +621,38 @@ _MINECRAFT_COMMANDS = """**Minecraft (in-game chat)**
 `/find [player] [name]` / `/locations [player]` — everyone
 `/shophelp` / `/mccommands` — everyone
 `/balance` (`/bal`) / `/balancetop` / `/pay <player> <amount>` — everyone
-Shop signs (ChestShop) — everyone, no command — right-click trades, and also shows a breakdown of owner/price/item
+Shop signs (ChestShop) — everyone, no command — see the shop sign format below
 Sneak + right-click glass — cycles its color, then tinted glass, then back to plain (no command)
 `/eco give\\|take\\|set <player> <amount>` — op only
 `/op` / `/deop` / `/lp ...` (LuckPerms) — op / console only
 WorldEdit (`//wand`, `//set`, etc.) — op / builder only, not itemized here"""
 
+# Values match this server's ChestShop config: REVERSE_BUTTONS false (so
+# right-click buys, left-click sells), ALLOW_AUTO_ITEM_FILL true (line 4
+# accepts "?"), BLOCK_SHOPS_WITH_SELL_PRICE_HIGHER_THAN_BUY_PRICE true,
+# SHOP_CREATION_PRICE 0, USE_BUILT_IN_PROTECTION true, and SHOP_CONTAINERS
+# limited to CHEST/TRAPPED_CHEST. Re-check config.yml before editing this.
+_SHOP_SIGN = """**Shop sign format**
+Put a chest (or trapped chest) down, fill it with what you're selling, then place a sign on it:
+```
+line 1:  (leave blank)
+line 2:  64
+line 3:  B 100 : S 50
+line 4:  diamond
+```
+`line 1` auto-fills with your name. `line 2` is how many items each trade moves. \
+`line 4` is the item — put `?` to auto-fill it from whatever is in the chest.
+On `line 3`, `B` is what a customer pays to **buy** from you and `S` is what you pay to \
+**buy from them**; use one or both. `S` cannot be higher than `B`.
+Right-click the sign to buy, left-click to sell. Shops are free to make, and the chest is \
+protected as soon as the sign goes up."""
+
 _COMMAND_REFERENCE = f"""
 {_DISCORD_COMMANDS}
 
 {_MINECRAFT_COMMANDS}
+
+{_SHOP_SIGN}
 
 Some Discord commands quietly bridge to Minecraft over RCON as a separate \
 console-only command (e.g. `/joinmessage` → `setjoinmessagemc`) — those \
@@ -638,14 +660,19 @@ bridge commands aren't directly runnable by anyone and are left off this list.
 """
 
 
+# Sent as embeds rather than plain messages: the full reference is past
+# Discord's 2000-character limit for message content, which would make
+# /commands fail to send outright. An embed description allows 4096.
 @client.tree.command(name="commands", description="List available commands and where each one works")
 async def commands_cmd(interaction: discord.Interaction):
-    await interaction.response.send_message(_COMMAND_REFERENCE, ephemeral=True)
+    embed = discord.Embed(description=_COMMAND_REFERENCE)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @client.tree.command(name="mccommands", description="List only the Minecraft in-game commands")
 async def mccommands_cmd(interaction: discord.Interaction):
-    await interaction.response.send_message(_MINECRAFT_COMMANDS, ephemeral=True)
+    embed = discord.Embed(description=f"{_MINECRAFT_COMMANDS}\n\n{_SHOP_SIGN}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 async def push_mccommands() -> None:
