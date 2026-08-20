@@ -1,4 +1,4 @@
-# rlbot
+# discordbot
 
 Discord bot, Python + discord.py, runs in Docker in Proxmox CT 100
 ("jack-dreams", 192.168.1.235). Rebuild after ANY code change:
@@ -6,7 +6,7 @@ Discord bot, Python + discord.py, runs in Docker in Proxmox CT 100
 (applies to any of the split-out modules below, not just bot.py).
 
 As of 2026-08-19, split across four files instead of one:
-- `bot.py` — RLBot class + every `/command` handler, `_COMMAND_REFERENCE`.
+- `bot.py` — DiscordBot class + every `/command` handler, `_COMMAND_REFERENCE`.
 - `storage.py` — generic `load_json`/`save_json` + typed wrappers for
   links/locations/joinmessages (was three hand-duplicated pairs).
 - `mc.py` — RCON, container start/stop/status, the chat bridge (incl.

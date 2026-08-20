@@ -3,7 +3,7 @@ start/stop/status, and the log-tail chat bridge (which now also carries
 location sync — see _sync_location_from_game/_remove_location_from_game).
 
 Needs a discord.Client set via init() before the bridge or announcements
-can reach Discord — done once from bot.py right after RLBot() is created,
+can reach Discord — done once from bot.py right after DiscordBot() is created,
 to avoid a circular import (bot.py already imports this module).
 """
 
@@ -19,7 +19,7 @@ from aiomcrcon import Client, IncorrectPasswordError, RCONConnectionError
 
 import storage
 
-log = logging.getLogger("rlbot.mc")
+log = logging.getLogger("discordbot.mc")
 
 MC_HOST = os.getenv("MC_HOST", "192.168.1.183")
 MC_RCON_PORT = int(os.getenv("MC_RCON_PORT", "25575"))

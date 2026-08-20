@@ -41,7 +41,7 @@ Copy the folder into CT 100, then:
 cp .env.example .env
 nano .env          # fill in all three values
 docker compose up -d --build
-docker logs -f rlbot
+docker logs -f discordbot
 ```
 
 You want to see `Logged in as ...` and `Commands synced to guild ...`.

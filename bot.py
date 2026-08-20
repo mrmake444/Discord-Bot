@@ -17,7 +17,7 @@ Two-way MC chat bridge (see .env.example): set MC_CHAT_CHANNEL_ID to the
 Discord channel to mirror chat in both directions. Requires the "Message
 Content" privileged intent enabled on the Bot page in the Developer Portal.
 
-Structure: this file is the Discord-facing half only — the RLBot class and
+Structure: this file is the Discord-facing half only — the DiscordBot class and
 every /command handler. Everything Minecraft-connectivity-related (RCON,
 container start/stop, the chat bridge + location sync) lives in mc.py;
 Tracker.gg lookups live in tracker.py; JSON persistence lives in storage.py.
@@ -41,7 +41,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
 )
-log = logging.getLogger("rlbot")
+log = logging.getLogger("discordbot")
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = os.getenv("GUILD_ID")
@@ -71,7 +71,7 @@ LOCATION_COLOR_CHOICES = [
 DEFAULT_LOCATION_COLOR = "e"
 
 
-class RLBot(discord.Client):
+class DiscordBot(discord.Client):
     def __init__(self):
         # message_content is a privileged intent needed to read chat text
         # for the MC bridge — must also be enabled on the Bot page in the
@@ -128,7 +128,7 @@ class RLBot(discord.Client):
         await mc.rcon(f"tellraw @a {payload}")
 
 
-client = RLBot()
+client = DiscordBot()
 mc.init(client)
 
 
@@ -621,7 +621,7 @@ __Rocket League__
 `/rlstats <platform> <player>`
 
 __Help__
-`/commands` · `/mccommands` · `/economy`
+`/commands` · `/mccommands` · `/economy` · `/miku`
 
 __Feature requests__
 `/request <feature>` · `/requests [include_done]`
@@ -651,7 +651,7 @@ __Locations, pins and the map__
 `/sethome` (Essentials) — also pins home on your HUD
 
 __Help and odds and ends__
-`/mccommands` · `/shophelp`
+`/mccommands` · `/shophelp` · `/miku` — ooo wee ooo
 Sneak + right-click glass — cycles color, then tinted, then plain
 
 __Op only__
@@ -739,6 +739,17 @@ async def commands_cmd(interaction: discord.Interaction):
 async def economy_cmd(interaction: discord.Interaction):
     embed = discord.Embed(description=_ECONOMY)
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# Static text rather than an RCON call, for the same reason /economy is:
+# it has to answer while the Minecraft server is asleep under lazymc, and
+# there is nothing here worth waking a server for. The in-game half
+# (miku.sk on CT 101) is the one that broadcasts to chat and plays the
+# flute riff; this is only the Discord side saying the same thing. Public,
+# not ephemeral — the whole point is that other people see it.
+@client.tree.command(name="miku", description="ooo wee ooo")
+async def miku_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message("ooo wee ooo")
 
 
 # Feature requests. Deliberately public rather than ephemeral: the point is

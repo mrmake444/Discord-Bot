@@ -23,7 +23,7 @@ class TrackerError(Exception):
 
 async def fetch_profile(session: aiohttp.ClientSession, platform: str, name: str) -> dict:
     """Pull a player profile from Tracker.gg. `session` must already carry
-    the TRN-Api-Key header (set on RLBot's session in bot.py)."""
+    the TRN-Api-Key header (set on DiscordBot's session in bot.py)."""
     url = f"{TRN_BASE}/{platform}/{name}"
 
     async with session.get(url) as resp:

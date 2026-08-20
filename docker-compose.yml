@@ -1,7 +1,7 @@
 services:
-  rlbot:
+  discordbot:
     build: .
-    container_name: rlbot
+    container_name: discordbot
     restart: unless-stopped
     env_file: .env
     volumes:
