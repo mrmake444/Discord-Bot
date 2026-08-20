@@ -182,6 +182,20 @@ minimum_online_time=120, start_timeout=300.
     fail with "response too long" instead of showing them; use a
     direct RCON client (e.g. this repo's data/tools/rcon_client.py)
     to see the real error text in that situation.
+  - **`on command` fires for console commands too.** Skript's
+    EvtCommand binds `ServerCommandEvent` as well as
+    `PlayerCommandPreprocessEvent`, so any `on command` trigger also
+    runs for every `execute console command` — and hud.sk fires ~13 of
+    those per player per second. Guard player-only hooks with
+    `if player is not set: stop trigger`, both to avoid the pointless
+    work and because `%player%` interpolates to `<none>` with no
+    player, which silently writes `<none>`-keyed variables (there is
+    already such junk in variables.csv from a console /setlocation).
+  - Anything inside `tickHud`/`tickRaceFall`/`tickDoubleFist` is paid
+    once per player per second, and anything inside their loops is paid
+    per pin/per tracked player on top of that. Hoist world/coordinate
+    lookups and repeated `{loc.*}` reads into locals rather than
+    re-evaluating them per entry.
   - clock.sk — the *only* `every 1 second: loop all players` trigger
     on the server; calls `tickHud(loop-player)` (hud.sk),
     `tickRaceFall(loop-player)` (race.sk) and
