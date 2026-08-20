@@ -695,7 +695,6 @@ Kill hostile mobs — $5 common, $12 tough, up to $250 a boss
 Mine ore — $1-$15 a block, best on emerald and ancient debris
 Win a race — $200 from the house (`/race` in game)
 Kill a player — 10% of their money, capped at $500
-First join — a one-off $100 welcome bonus
 
 **Losing**
 Taking a hit from a mob — $1 a hit, which funds the race prize pot
