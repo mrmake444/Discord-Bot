@@ -617,6 +617,7 @@ _MINECRAFT_COMMANDS = """**Minecraft (in-game chat)**
 `/setlocation <name> [color]` / `/removelocation <name>` — everyone
 `/pin <name\\|player> [permanent]` / `/unpin <name\\|player>` — everyone, takes a saved location or a player
 `/track <player> [permanent]` / `/untrack <player>` — everyone, the player-only spelling of `/pin`
+`/hidepins` — everyone, toggles pins off the sidebar; they stay on Tab
 `/sethome` (Essentials) — everyone, also pins "home" on the HUD automatically
 `/find [player] [name]` / `/locations [player]` — everyone
 `/shophelp` / `/mccommands` — everyone

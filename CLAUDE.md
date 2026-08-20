@@ -183,10 +183,26 @@ minimum_online_time=120, start_timeout=300.
     direct RCON client (e.g. this repo's data/tools/rcon_client.py)
     to see the real error text in that situation.
   - clock.sk — the *only* `every 1 second: loop all players` trigger
-    on the server; calls `tickHud(loop-player)` (hud.sk) and
-    `tickRaceFall(loop-player)` (race.sk) so per-player per-second
-    work happens in one shared loop instead of each script running
-    its own (locationhud.sk and race.sk used to, independently).
+    on the server; calls `tickHud(loop-player)` (hud.sk),
+    `tickRaceFall(loop-player)` (race.sk) and
+    `tickDoubleFist(loop-player)` (doublefist.sk) so per-player
+    per-second work happens in one shared loop instead of each script
+    running its own (locationhud.sk and race.sk used to,
+    independently). Reload doublefist.sk/hud.sk/race.sk *before*
+    clock.sk when adding a tick function, or clock.sk reloads against
+    a function that does not exist yet.
+  - doublefist.sk — broadcasts `<name> is double fisting` when a
+    player holds a shield in both hands. **The chat-line shape is
+    load-bearing:** mc.py's `CHAT_LINE_RE` matches
+    `[HH:MM:SS] [<thread>]: <name> message`, and Skript's `broadcast`
+    writes to console as well as to players, so one broadcast reaches
+    both halves of the two-way chat with no bridge change. Adding a
+    colour code or a "[Server]" prefix would break the match and
+    silently make it in-game only. Edge-triggered off
+    `{doublefist::*}` so it fires once per equip, not once a second.
+    Verified that the `is a shield` comparison also matches enchanted
+    and damaged shields (the alias carries no meta) and does not
+    false-positive on other items.
   - locations.sk — /setlocation, /removelocation, /find, /locations,
     plus /setlocationmc, /removelocationmc (console-only, RCON-pushed
     from bot.py). Also prints LOCSYNC/LOCREMOVE to console (see the
