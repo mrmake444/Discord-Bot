@@ -3,6 +3,10 @@ Rocket League stats bot.
 
 Slash commands:
     /rlstats <platform> <player>   current ranks from Tracker.gg
+    /balance [user] [username]     someone's in-game money
+    /balancetop                    the richest players
+    /bounty <player> <amount>      put a price on someone's head
+    /bounties [player]             the bounty board
     /economy                       how the in-game money system works
     /request <feature>             ask for a feature; /requests lists them
     /ping                          liveness check
@@ -27,6 +31,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 
 import aiohttp
@@ -590,6 +595,308 @@ async def shutdown_cmd(interaction: discord.Interaction):
     await interaction.followup.send(result)
 
 
+# --- money and bounties -----------------------------------------------------
+# All four of these read live state off the Minecraft server, so unlike
+# /economy (static text, deliberately, so it still answers while the server
+# sleeps) they need it awake. RCON on 25575 does NOT wake a sleeping server —
+# only a login handshake on 25565 does — so an asleep server fails cleanly
+# here instead of costing a 60s boot nobody asked for.
+#
+# /bounty and /bounties bridge to bountymc / bountylistmc, the console-only
+# half of bounty.sk on CT 101. Those reply with colon-delimited records in
+# the RCON response body; the tags and field order below have to stay in
+# sync with that script.
+
+BOUNTY_MIN = 50      # mirrors {@MIN} in bounty.sk
+BOUNTY_MAX = 5000    # mirrors {@MAX} in bounty.sk
+BOUNTY_LIST_LIMIT = 15
+BOUNTY_MARK = "☠"
+
+_BOUNTY_TAGS = frozenset({
+    "BOUNTY", "BOUNTYEND", "BOUNTYON", "BOUNTYFROM",
+    "BOUNTYNONE", "BOUNTYOK", "BOUNTYERR",
+})
+
+# Every RCON command below interpolates a username into a command string, so
+# anything that isn't a real Minecraft name is rejected before it gets there
+# — a value with a space in it would otherwise arrive as extra arguments.
+_MC_NAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
+
+_BALTOP_ROW_RE = re.compile(r"^\s*(\d+)\.\s*(\S+?),\s*\$([\d,]+(?:\.\d+)?)\s*$")
+_BALANCE_RE = re.compile(r"Balance of\s+(\S+?)\s*:\s*\$([\d,]+(?:\.\d+)?)")
+
+
+def _linked_username(user: discord.abc.User) -> str | None:
+    return storage.load_links().get(str(user.id))
+
+
+def _fmt_money(value) -> str:
+    """Skript sends plain numbers ("125", "917.5"); Essentials prints its own
+    already-formatted string. Render both the way the game does — thousands
+    separators, and cents only when there are any."""
+    try:
+        n = float(str(value).replace(",", ""))
+    except ValueError:
+        return str(value)
+    return f"${n:,.2f}" if n % 1 else f"${n:,.0f}"
+
+
+def _parse_bounty_reply(resp: str) -> list[tuple[str, list[str]]]:
+    """Pulls the BOUNTY* records out of an RCON reply, ignoring every other
+    line. `broadcast` output lands in the same response body, so this cannot
+    just split the whole thing on newlines and trust it."""
+    records = []
+    for line in mc.strip_colors(resp).splitlines():
+        tag, sep, rest = line.strip().partition(":")
+        if sep and tag in _BOUNTY_TAGS:
+            records.append((tag, rest.split(":")))
+    return records
+
+
+async def _resolve_target(interaction: discord.Interaction, player: str) -> str | None:
+    """Validates a username argument, replying with the reason if it's not
+    usable. Returns None when the caller should stop."""
+    name = player.strip()
+    if not _MC_NAME_RE.match(name):
+        await interaction.followup.send(
+            f"`{name[:32]}` isn't a valid Minecraft username.", ephemeral=True
+        )
+        return None
+    return name
+
+
+async def _linked_username_or_reply(interaction: discord.Interaction) -> str | None:
+    username = _linked_username(interaction.user)
+    if username is None:
+        await interaction.followup.send(
+            "You aren't linked — run `/link <username>` first so I know which "
+            "in-game account to charge.",
+            ephemeral=True,
+        )
+    return username
+
+
+async def _link_autocomplete(interaction: discord.Interaction, current: str):
+    """Suggests usernames from links.json only — deliberately no RCON call.
+    Discord gives autocomplete about 3 seconds and mc.rcon alone can take 5,
+    so a round trip to the server here would just time out the whole box."""
+    names = sorted(set(storage.load_links().values()))
+    current = current.lower()
+    return [
+        app_commands.Choice(name=n, value=n)
+        for n in names if current in n.lower()
+    ][:25]
+
+
+@client.tree.command(name="bounty", description="Put money on a player's head, paid to whoever kills them")
+@app_commands.describe(
+    player="Minecraft username to put the bounty on",
+    amount=f"How much to add (${BOUNTY_MIN}-${BOUNTY_MAX}) — taken from your balance immediately",
+)
+@app_commands.autocomplete(player=_link_autocomplete)
+async def bounty_cmd(
+    interaction: discord.Interaction,
+    player: str,
+    amount: app_commands.Range[int, BOUNTY_MIN, BOUNTY_MAX],
+):
+    await interaction.response.defer()
+
+    placer = await _linked_username_or_reply(interaction)
+    if placer is None:
+        return
+    target = await _resolve_target(interaction, player)
+    if target is None:
+        return
+
+    resp = await mc.rcon(f"bountymc {placer} {target} {amount}")
+    if resp in mc._RCON_ERROR_STRINGS:
+        await interaction.followup.send(resp, ephemeral=True)
+        return
+
+    records = dict(_parse_bounty_reply(resp))
+
+    if "BOUNTYERR" in records:
+        fields = records["BOUNTYERR"]
+        reason, detail = fields[0], (fields[1] if len(fields) > 1 else "")
+        messages = {
+            "self": "You can't put a price on your own head.",
+            "noplacer": f"Your linked username `{placer}` has never joined the server — "
+                        "`/link` it to the right name.",
+            "notarget": f"No player called `{detail}` has ever joined the server.",
+            "funds": f"Not enough money — you have {_fmt_money(detail)}.",
+            "min": f"Minimum bounty is {_fmt_money(detail)}.",
+            "max": f"Most you can add at once is {_fmt_money(detail)}.",
+        }
+        await interaction.followup.send(
+            messages.get(reason, f"Couldn't place that bounty (`{reason}`)."), ephemeral=True
+        )
+        return
+
+    if "BOUNTYOK" not in records:
+        log.warning("unparseable bountymc reply: %r", resp)
+        await interaction.followup.send(
+            "The server didn't confirm that — check `/bounties` before trying again.",
+            ephemeral=True,
+        )
+        return
+
+    name, added, pot = records["BOUNTYOK"][:3]
+    log.info("bounty %s -> %s %s (pot %s)", placer, name, added, pot)
+    await interaction.followup.send(
+        f"{BOUNTY_MARK} **{placer}** put {_fmt_money(added)} on **{name}**'s head.\n"
+        f"Total on them now: **{_fmt_money(pot)}** — paid to whoever kills them, "
+        "less the 5% house cut.\n"
+        f"-# `/bounties` to see the board."
+    )
+
+
+@client.tree.command(name="bounties", description="List the bounties standing on people's heads")
+@app_commands.describe(player="Show who is funding the bounty on one player (optional)")
+@app_commands.autocomplete(player=_link_autocomplete)
+async def bounties_cmd(interaction: discord.Interaction, player: str | None = None):
+    await interaction.response.defer()
+
+    if player is not None:
+        target = await _resolve_target(interaction, player)
+        if target is None:
+            return
+        resp = await mc.rcon(f"bountylistmc {target}")
+    else:
+        resp = await mc.rcon("bountylistmc")
+
+    if resp in mc._RCON_ERROR_STRINGS:
+        await interaction.followup.send(resp, ephemeral=True)
+        return
+
+    records = _parse_bounty_reply(resp)
+    tags = {tag for tag, _ in records}
+
+    if "BOUNTYNONE" in tags:
+        await interaction.followup.send(
+            f"No bounty on `{player}`. `/bounty {player} <amount>` starts one.",
+            ephemeral=True,
+        )
+        return
+
+    if player is not None:
+        header = next(f for tag, f in records if tag == "BOUNTYON")
+        funders = [f for tag, f in records if tag == "BOUNTYFROM"]
+        body = "\n".join(
+            f"• **{who}** — {_fmt_money(amt)}" for who, amt in (f[:2] for f in funders)
+        )
+        embed = discord.Embed(
+            title=f"{BOUNTY_MARK} {header[0]} — {_fmt_money(header[1])}",
+            description=f"Funded by:\n{body}\n\n"
+                        "-# Kill them and it's yours, less the 5% house cut.",
+        )
+        await interaction.followup.send(embed=embed)
+        return
+
+    entries = [f[:2] for tag, f in records if tag == "BOUNTY"]
+    if not entries:
+        await interaction.followup.send(
+            "Nobody has a price on their head. `/bounty <player> <amount>` fixes that.",
+            ephemeral=True,
+        )
+        return
+
+    # Biggest first — bounty.sk emits them in variable order, not by size.
+    entries.sort(key=lambda e: float(e[1]), reverse=True)
+    shown = entries[:BOUNTY_LIST_LIMIT]
+    body = "\n".join(
+        f"**{i}.** {name} — {_fmt_money(amt)}"
+        for i, (name, amt) in enumerate(shown, 1)
+    )
+    if len(entries) > len(shown):
+        body += f"\n-# ...and {len(entries) - len(shown)} smaller one(s) not shown."
+
+    end = next((f for tag, f in records if tag == "BOUNTYEND"), None)
+    if end and len(end) > 1:
+        body += f"\n\n-# {end[0]} standing · {_fmt_money(end[1])} on the table"
+
+    embed = discord.Embed(title=f"{BOUNTY_MARK} Standing bounties", description=body)
+    await interaction.followup.send(embed=embed)
+
+
+@client.tree.command(name="balance", description="Check someone's in-game money")
+@app_commands.describe(
+    user="@ mention a linked Discord member (optional, defaults to you)",
+    username="Or a Minecraft username directly",
+)
+@app_commands.autocomplete(username=_link_autocomplete)
+async def balance_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+    username: str | None = None,
+):
+    await interaction.response.defer()
+
+    if user is not None:
+        mc_username = _linked_username(user)
+        if mc_username is None:
+            await interaction.followup.send(
+                f"{user.mention} isn't linked — they need to run `/link <username>`.",
+                ephemeral=True,
+            )
+            return
+    elif username is not None:
+        mc_username = username
+    else:
+        mc_username = await _linked_username_or_reply(interaction)
+        if mc_username is None:
+            return
+
+    target = await _resolve_target(interaction, mc_username)
+    if target is None:
+        return
+
+    resp = await mc.rcon(f"balance {target}")
+    if resp in mc._RCON_ERROR_STRINGS:
+        await interaction.followup.send(resp, ephemeral=True)
+        return
+
+    m = _BALANCE_RE.search(mc.strip_colors(resp))
+    if m is None:
+        # Essentials answers an unknown name with "Error: Player not found."
+        await interaction.followup.send(
+            f"No balance for `{target}` — have they joined the server?", ephemeral=True
+        )
+        return
+
+    await interaction.followup.send(f"\U0001f4b0 **{m.group(1)}** — {_fmt_money(m.group(2))}")
+
+
+@client.tree.command(name="balancetop", description="The richest players on the server")
+async def balancetop_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    # Essentials builds this list asynchronously and answers the call that
+    # triggered the rebuild with an EMPTY body, so a cold first request looks
+    # like an empty server. One retry is enough to pick up the built cache.
+    for attempt in range(2):
+        resp = await mc.rcon("balancetop")
+        if resp in mc._RCON_ERROR_STRINGS:
+            await interaction.followup.send(resp, ephemeral=True)
+            return
+        clean = mc.strip_colors(resp)
+        rows = [m.groups() for m in (_BALTOP_ROW_RE.match(l) for l in clean.splitlines()) if m]
+        if rows or attempt:
+            break
+        await asyncio.sleep(1.5)
+
+    if not rows:
+        await interaction.followup.send("Couldn't read the balance list.", ephemeral=True)
+        return
+
+    body = "\n".join(f"**{rank}.** {name} — {_fmt_money(amt)}" for rank, name, amt in rows[:20])
+    total = re.search(r"Server Total:\s*\$([\d,]+(?:\.\d+)?)", clean)
+    if total:
+        body += f"\n\n-# Server total: {_fmt_money(total.group(1))}"
+
+    embed = discord.Embed(title="\U0001f4b0 Richest players", description=body)
+    await interaction.followup.send(embed=embed)
+
+
 # --- /commands, /mccommands -------------------------------------------------
 # Static reference, not introspected — Discord slash commands and Minecraft
 # in-game/console commands live in entirely separate systems (discord.py's
@@ -617,6 +924,10 @@ __Your account__
 `/link <username>` · `/unlink`
 `/joinmessage <text>` · `/removejoinmessage` — `/link` first
 
+__Money and bounties__
+`/balance [player]` · `/balancetop` — needs the server awake
+`/bounty <player> <amount>` · `/bounties [player]` — `/link` first
+
 __Rocket League__
 `/rlstats <platform> <player>`
 
@@ -641,6 +952,14 @@ Shop signs (ChestShop) — no command; format below
 __Gambling and racing__
 `/casino` · `/bet <racer> <amount>` · `/lotto [buy <n>]`
 `/race` · `/start` · `/raceleave` — the ice boat race
+`/bounty [player] [amount]` — a price on their head, paid to whoever kills them
+
+__Land claims__
+`/claim` — golden shovel: click one corner, then the opposite
+`/trust <player>` · `/untrust <player>` — let someone build in your claim
+`/containertrust` · `/accesstrust` — chests only / doors and buttons only
+`/claimslist` · `/abandonclaim` · `/buyclaimblocks <n>` — $0.25 a block
+A stick shows who owns the land you're looking at
 
 __Locations, pins and the map__
 `/setlocation <name> [color]` · `/removelocation <name>` · `/locations [player]`
@@ -651,11 +970,12 @@ __Locations, pins and the map__
 `/sethome` (Essentials) — also pins home on your HUD
 
 __Help and odds and ends__
-`/mccommands` · `/shophelp` · `/miku` — ooo wee ooo
+`/mccommands` · `/shophelp` · `/miku` — oo ee oo
 Sneak + right-click glass — cycles color, then tinted, then plain
 
 __Op only__
 `/casinoadmin add|take|set <amount>` — the house bankroll
+`/bountyadmin clear <player>|clearall` — refunds the placers
 `/eco give|take|set <player> <amount>`
 `/op` · `/deop` · `/lp ...` (LuckPerms) — op / console
 WorldEdit (`//wand`, `//set`, etc.) — op / builder, not itemized here"""
@@ -747,9 +1067,9 @@ async def economy_cmd(interaction: discord.Interaction):
 # (miku.sk on CT 101) is the one that broadcasts to chat and plays the
 # flute riff; this is only the Discord side saying the same thing. Public,
 # not ephemeral — the whole point is that other people see it.
-@client.tree.command(name="miku", description="ooo wee ooo")
+@client.tree.command(name="miku", description="oo ee oo")
 async def miku_cmd(interaction: discord.Interaction):
-    await interaction.response.send_message("ooo wee ooo")
+    await interaction.response.send_message("oo ee oo")
 
 
 # Feature requests. Deliberately public rather than ephemeral: the point is

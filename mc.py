@@ -147,8 +147,15 @@ async def mc_status():
         return None
 
 
+def strip_colors(text: str) -> str:
+    """Drops legacy section colour codes and ANSI escapes. Essentials wraps
+    almost everything it prints in them, so any RCON reply being parsed
+    rather than relayed verbatim has to come through here first."""
+    return _COLOUR_RE.sub("", text or "")
+
+
 def parse_list(resp: str) -> tuple[int, list[str]]:
-    m = _LIST_RE.search(_COLOUR_RE.sub("", resp or ""))
+    m = _LIST_RE.search(strip_colors(resp))
     if not m:
         return 0, []
     online = int(m.group(1))
